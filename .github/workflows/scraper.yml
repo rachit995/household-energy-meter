@@ -110,9 +110,9 @@ jobs:
         # in public action logs). GitHub Actions Variables would render as
         # plaintext in logs — avoid for anything that could identify a user.
         env:
-          SMARTGRID_COMPANY: ${{ secrets.SMARTGRID_COMPANY }}
-          SMARTGRID_USERNAME: ${{ secrets.SMARTGRID_USERNAME }}
-          SMARTGRID_PASSWORD: ${{ secrets.SMARTGRID_PASSWORD }}
+          SMARTGRID_SITE_ID: ${{ secrets.SMARTGRID_SITE_ID }}
+          SMARTGRID_UNIT_ID: ${{ secrets.SMARTGRID_UNIT_ID }}
+          SMARTGRID_METER_ID: ${{ secrets.SMARTGRID_METER_ID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}

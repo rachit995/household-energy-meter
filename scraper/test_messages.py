@@ -15,7 +15,7 @@ load_dotenv()
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from scraper import (
-    create_session, login, scrape_meter_data, send_telegram_message, send_telegram_photo,
+    create_client, scrape_meter_data, send_telegram_message, send_telegram_photo,
     build_morning_message, build_afternoon_message, build_evening_message, build_weekly_message,
     build_monthly_message, build_recharge_analysis, build_recharge_advisor,
     check_spending_trend, check_consumption_spike, check_dg_usage,
@@ -50,12 +50,10 @@ def send_img(label, img_buf):
 
 
 def main():
-    print("Connecting to portal...")
+    print("Fetching meter data via API...")
     start = time.time()
-    session = create_session()
-    login(session)
-
-    balance, current_month, prev_day, prev_month, monthly_consumption, today, daily_readings, prev_prev_month, last_sync, rate_card, grace_credit, portal_recharges, electrical_params = scrape_meter_data(session)
+    with create_client() as client:
+        balance, current_month, prev_day, prev_month, monthly_consumption, today, daily_readings, prev_prev_month, last_sync, rate_card, grace_credit, portal_recharges, electrical_params = scrape_meter_data(client)
     duration = time.time() - start
     print(f"Scraped in {duration:.1f}s — balance: ₹{balance}, {len(daily_readings)} daily readings, {len(portal_recharges)} recharges\n")
 

@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-Energy Meter Scraper for Smartgridsoft Portal
-Uses direct HTTP requests + BeautifulSoup (no browser needed)
+Energy Meter Scraper — SmartGridSoft mobile API backend.
+
+Data acquisition uses the vendor's undocumented JSON API at
+``http://103.105.155.227:86/WebServicesMeterData.svc/`` (no auth; bootstrap
+IDs via ``scripts/bootstrap_ids.py``). Storage, alerts, charts, and Telegram
+formatting are unchanged — the adapter in ``scraper/normalizer.py`` reproduces
+the exact contract the HTML scraper used to return.
 """
 
 import argparse
@@ -12,16 +17,17 @@ import logging
 import time
 from dotenv import load_dotenv
 import requests
-from bs4 import BeautifulSoup
 from storage import (save_daily, save_daily_costs, save_monthly, save_recharge, save_rates, extract_recharges,
                       save_portal_recharges, load_portal_recharges, detect_new_recharges, merge_portal_recharges_to_history,
-                      cleanup_duplicate_recharges, load_daily_readings,
+                      cleanup_duplicate_recharges, load_daily_readings, load_historical_months,
                       # Phase 2: high-frequency readings + edge-triggered alerts
                       save_reading, load_readings, load_previous_reading,
                       get_alert_state, set_alert_state)
 from charts import (render_table_image, render_bar_chart, render_spend_chart,
                      render_donut_chart, render_line_chart, render_grouped_bars,
                      render_time_profile_chart)
+from api_client import SmartGridClient
+from normalizer import normalize
 
 load_dotenv()
 from datetime import date, datetime, timezone, timedelta
@@ -46,27 +52,21 @@ logger = logging.getLogger(__name__)
 
 # Configuration from environment variables
 CONFIG = {
-    "LOGIN_URL": "https://www.smartgridsoft.in/WebsitePages/Login.aspx",
-    "METER_URL": "https://www.smartgridsoft.in/WebsitePages/MyMeter.aspx",
-    "COMPANY": os.getenv("SMARTGRID_COMPANY", ""),
-    "USERNAME": os.getenv("SMARTGRID_USERNAME", ""),
-    "PASSWORD": os.getenv("SMARTGRID_PASSWORD", ""),
-    "LOW_BALANCE_THRESHOLD": Decimal(os.getenv("LOW_BALANCE_THRESHOLD", "800")),
+    "SITE_ID": os.getenv("SMARTGRID_SITE_ID", ""),
+    "UNIT_ID": os.getenv("SMARTGRID_UNIT_ID", ""),
+    "METER_ID": os.getenv("SMARTGRID_METER_ID", ""),
     "MONTHLY_BUDGET": Decimal(os.getenv("MONTHLY_BUDGET", "8000")),
-}
-
-# Map company names to their dropdown option values
-COMPANY_IDS = {
-    "Olive County": "53",
-    "Bharat City": "21",
-    "Gulshan Ikebana": "23",
-    "Exotica Dreamville": "24",
-    "Cherry County": "26",
 }
 
 
 def parse_decimal(value):
-    """Parse string to Decimal, handling empty values"""
+    """Parse string to Decimal, handling empty values.
+
+    Kept for compatibility with a few remaining non-portal call sites; the
+    API-path normalizer has its own ``_parse_decimal`` with the same
+    semantics (module-local copy keeps ``normalizer.py`` importable without
+    a circular dependency through ``scraper.py``).
+    """
     if not value or value.strip() in ["", "-"]:
         return None
     try:
@@ -76,275 +76,47 @@ def parse_decimal(value):
         return None
 
 
-def create_session():
-    """Create an HTTP session with browser-like headers"""
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": CONFIG["LOGIN_URL"],
-    })
-    return session
+def create_client():
+    """Build a SmartGridClient from SMARTGRID_SITE_ID / UNIT_ID / METER_ID."""
+    return SmartGridClient(
+        site_id=CONFIG["SITE_ID"],
+        unit_id=CONFIG["UNIT_ID"],
+        meter_id=CONFIG["METER_ID"],
+    )
 
 
-def get_hidden_fields(soup):
-    """Extract ASP.NET hidden form fields from a page"""
-    return {
-        "__VIEWSTATE": soup.find("input", {"name": "__VIEWSTATE"})["value"],
-        "__VIEWSTATEGENERATOR": soup.find("input", {"name": "__VIEWSTATEGENERATOR"})["value"],
-        "__EVENTVALIDATION": soup.find("input", {"name": "__EVENTVALIDATION"})["value"],
-    }
-
-
-def login(session):
-    """Login to Smartgridsoft portal via HTTP POST"""
-    logger.info("Logging in...")
-
-    company_id = COMPANY_IDS.get(CONFIG["COMPANY"])
-    if not company_id:
-        raise ValueError(f"Unknown company: {CONFIG['COMPANY']}. Known: {list(COMPANY_IDS.keys())}")
-
-    # GET login page
-    r = session.get(CONFIG["LOGIN_URL"])
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    # Step 1: Company dropdown postback (updates __VIEWSTATE and __EVENTVALIDATION)
-    payload = get_hidden_fields(soup)
-    payload.update({
-        "__EVENTTARGET": "ddlsocietyname",
-        "__EVENTARGUMENT": "",
-        "__LASTFOCUS": "",
-        "ddlsocietyname": company_id,
-        "txtusername": "",
-        "txtpassword": "",
-    })
-    r2 = session.post(CONFIG["LOGIN_URL"], data=payload)
-    soup2 = BeautifulSoup(r2.text, "html.parser")
-
-    # Step 2: Submit login form with credentials
-    payload2 = get_hidden_fields(soup2)
-    payload2.update({
-        "__EVENTTARGET": "",
-        "__EVENTARGUMENT": "",
-        "__LASTFOCUS": "",
-        "ddlsocietyname": company_id,
-        "txtusername": CONFIG["USERNAME"],
-        "txtpassword": CONFIG["PASSWORD"],
-        "btnsignin": "Sign In",
-    })
-    r3 = session.post(CONFIG["LOGIN_URL"], data=payload2, allow_redirects=True)
-
-    # Check for login failure (alert script in response)
-    if "Login" in r3.url:
-        soup3 = BeautifulSoup(r3.text, "html.parser")
-        for script in soup3.find_all("script"):
-            if "alert" in script.get_text():
-                raise ValueError("Login failed: Invalid username or password")
-        raise ValueError("Login failed: Still on login page")
-
-    logger.info("Login successful!")
-    return session
-
-
-def scrape_meter_data(session):
-    """Fetch MyMeter page and extract all data fields"""
-    logger.info("Fetching meter data...")
-    r = session.get(CONFIG["METER_URL"])
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    def get_field(field_id):
-        el = soup.find(id=field_id)
-        return parse_decimal(el.get_text(strip=True)) if el else None
-
-    def get_text(field_id):
-        el = soup.find(id=field_id)
-        return el.get_text(strip=True) if el else None
-
-    # Recharge balance
-    balance = get_field("ContentPlaceHolder1_lblbalance")
-    logger.debug(f"Recharge balance: ₹{balance}")
-
-    # Last sync time from server
-    last_sync = get_text("ContentPlaceHolder1_lbldatetime")
-    logger.debug(f"Last sync: {last_sync}")
-
-    # Current month deductions
-    current_month = {
-        "total": get_field("ContentPlaceHolder1_lbl_cmdtotal"),
-        "eb": get_field("ContentPlaceHolder1_lbl_cmdeb"),
-        "dg": get_field("ContentPlaceHolder1_lbl_cmddg"),
-        "fix_charge": get_field("ContentPlaceHolder1_lbl_cmdfixc"),
-    }
-    logger.debug(f"Current month deductions: {current_month}")
-
-    # Previous day deductions
-    prev_day = {
-        "total": get_field("ContentPlaceHolder1_lbl_pddtotal"),
-        "eb": get_field("ContentPlaceHolder1_lbl_pddeb"),
-        "dg": get_field("ContentPlaceHolder1_lbl_pdddg"),
-        "fix_charge": get_field("ContentPlaceHolder1_lbl_pddfixc"),
-    }
-    logger.debug(f"Previous day deductions: {prev_day}")
-
-    # Previous month deductions
-    prev_month = {
-        "total": get_field("ContentPlaceHolder1_lbl_pmdtotal"),
-        "eb": get_field("ContentPlaceHolder1_lbl_pmdeb"),
-        "dg": get_field("ContentPlaceHolder1_lbl_pmddg"),
-        "fix_charge": get_field("ContentPlaceHolder1_lbl_pmdfixc"),
-    }
-    logger.debug(f"Previous month deductions: {prev_month}")
-
-    # Monthly consumption history (last 6 months)
-    monthly_consumption = []
-    month_fields = [
-        ("ContentPlaceHolder1_lblmonth_one", "ContentPlaceHolder1_lblmonth_one_amount"),
-        ("ContentPlaceHolder1_lblmonth_two", "ContentPlaceHolder1_lblmonth_two_amount"),
-        ("ContentPlaceHolder1_lblmonth_three", "ContentPlaceHolder1_lblmonth_three_amount"),
-        ("ContentPlaceHolder1_lblmonth_four", "ContentPlaceHolder1_lblmonth_four_amount"),
-        ("ContentPlaceHolder1_lblmonth_five", "ContentPlaceHolder1_lblmonth_five_amount"),
-        ("ContentPlaceHolder1_lblmonth_six", "ContentPlaceHolder1_lblmonth_six_amount"),
-    ]
-    for name_id, amount_id in month_fields:
-        name = get_text(name_id)
-        amount = get_field(amount_id)
-        if name:
-            monthly_consumption.append({"month": name, "amount": amount})
-    logger.debug(f"Monthly consumption: {monthly_consumption}")
-
-    # Previous-previous month deductions (for month-over-month comparison)
-    prev_prev_month = {
-        "total": get_field("ContentPlaceHolder1_lbl_ppmdtotal"),
-        "eb": get_field("ContentPlaceHolder1_lbl_ppmdeb"),
-        "dg": get_field("ContentPlaceHolder1_lbl_ppmddg"),
-        "fix_charge": get_field("ContentPlaceHolder1_lbl_ppmdfixc"),
-    }
-    logger.debug(f"Previous-previous month deductions: {prev_prev_month}")
-
-    # Current day deductions
-    today = {
-        "total": get_field("ContentPlaceHolder1_lbl_cdd_total"),
-        "eb": get_field("ContentPlaceHolder1_lbl_cddeb"),
-        "dg": get_field("ContentPlaceHolder1_lbl_cdddg"),
-        "fix_charge": get_field("ContentPlaceHolder1_lblcddfixc"),
-    }
-    logger.debug(f"Current day deductions: {today}")
-
-    # Grace credit limit
-    grace_text = get_text("ContentPlaceHolder1_lbl_g_credit")
-    grace_credit = parse_decimal(grace_text.replace("INR", "").strip()) if grace_text else None
-    logger.debug(f"Grace credit: ₹{grace_credit}")
-
-    # Rate card
-    rate_card = {
-        "eb_rate": get_field("ContentPlaceHolder1_lbl_arebrate"),
-        "dg_rate": get_field("ContentPlaceHolder1_lbl_ardgrate"),
-        "fix_charge": get_field("ContentPlaceHolder1_lbl_arfixcrate"),
-    }
-    logger.debug(f"Rate card: {rate_card}")
-
-    # Daily readings from current + previous month tables (for weekly report)
-    daily_readings = scrape_daily_readings(soup)
-    logger.info(f"Daily readings: {len(daily_readings)} days scraped")
-
-    # Last 10 recharges from portal
-    portal_recharges = scrape_recharges(soup)
-    logger.info(f"Portal recharges: {len(portal_recharges)} entries scraped")
-
-    # Electrical parameters (real-time power draw, source changeover)
-    electrical_params = scrape_electrical_params(soup)
-    logger.debug(f"Electrical params: {electrical_params}")
-
-    return balance, current_month, prev_day, prev_month, monthly_consumption, today, daily_readings, prev_prev_month, last_sync, rate_card, grace_credit, portal_recharges, electrical_params
-
-
-def parse_date(date_str):
-    """Parse DD-MM-YYYY date string"""
+def _fetch_historical_months(now=None, count=4):
+    """Pad the 2 API-sourced monthly_consumption entries (prev + prev-prev)
+    up to 6 months using our own ``monthly_summaries`` table.
+    Returns a list safe to hand directly to ``normalize(..., historical_months=...)``."""
+    anchor = (now or datetime.now(IST)).date()
+    # prev-prev month in YYYY-MM (API covers everything at-or-after this).
+    total_month = anchor.year * 12 + (anchor.month - 1) - 2
+    year, month0 = divmod(total_month, 12)
+    threshold = f"{year:04d}-{month0 + 1:02d}"
     try:
-        return datetime.strptime(date_str.strip(), "%d-%m-%Y").date()
-    except ValueError:
-        return None
+        return load_historical_months(threshold, count=count)
+    except Exception as exc:
+        logger.warning(f"Could not load historical months from DB: {exc}")
+        return []
 
 
-def scrape_daily_readings(soup):
-    """Parse daily readings from current month (Table19) and previous month (Table20) tables"""
-    readings = []
+def scrape_meter_data(client):
+    """Fetch the full meter snapshot via the SmartGridSoft JSON API and adapt
+    it to the 13-tuple contract the rest of the scraper consumes.
 
-    for table_id in ["Table19", "Table20"]:
-        table = soup.find("table", id=table_id)
-        if not table:
-            continue
-        for row in table.find_all("tr"):
-            cells = row.find_all("td")
-            if len(cells) < 6:
-                continue
-            reading_date = parse_date(cells[0].get_text(strip=True))
-            if not reading_date:
-                continue
-            readings.append({
-                "date": reading_date,
-                "eb_reading": parse_decimal(cells[1].get_text(strip=True)),
-                "eb_consume": parse_decimal(cells[2].get_text(strip=True)),
-                "dg_reading": parse_decimal(cells[3].get_text(strip=True)),
-                "dg_consume": parse_decimal(cells[4].get_text(strip=True)),
-                "balance": parse_decimal(cells[5].get_text(strip=True)),
-            })
-
-    # Sort by date ascending (oldest first)
-    readings.sort(key=lambda r: r["date"])
-    return readings
-
-
-def scrape_recharges(soup):
-    """Parse the 'Last 10 Recharges' table from the portal page."""
-    recharges = []
-    # Find the title bar containing "Last 10 Recharges"
-    for title_div in soup.find_all("div", class_="title-bar"):
-        if "Last 10 Recharges" in title_div.get_text():
-            box = title_div.find_parent("div", class_="box")
-            if not box:
-                continue
-            table = box.find("table")
-            if not table:
-                continue
-            for row in table.find_all("tr"):
-                cells = row.find_all("td")
-                if len(cells) < 3:
-                    continue
-                amount = parse_decimal(cells[0].get_text(strip=True))
-                recharge_date = parse_date(cells[1].get_text(strip=True))
-                recharge_type = cells[2].get_text(strip=True)
-                if amount and recharge_date:
-                    recharges.append({
-                        "date": recharge_date,
-                        "amount": amount,
-                        "type": recharge_type,
-                    })
-            break
-    # Sort by date descending (newest first)
-    recharges.sort(key=lambda r: r["date"], reverse=True)
-    return recharges
-
-
-def scrape_electrical_params(soup):
-    """Extract real-time electrical parameters and source changeover from portal."""
-    def get_field(field_id):
-        el = soup.find(id=field_id)
-        return parse_decimal(el.get_text(strip=True)) if el else None
-
-    def get_text(field_id):
-        el = soup.find(id=field_id)
-        return el.get_text(strip=True) if el else None
-
-    return {
-        "active_power_kw": get_field("ContentPlaceHolder1_lblActivePower"),
-        "apparent_power_kva": get_field("ContentPlaceHolder1_lblApparentPower"),
-        "current_amp": get_field("ContentPlaceHolder1_lblCurrent"),
-        "voltage_ln": get_field("ContentPlaceHolder1_lblVoltageLN"),
-        "voltage_ll": get_field("ContentPlaceHolder1_lblVoltageLL"),
-        "power_factor": get_field("ContentPlaceHolder1_lblPF"),
-        "frequency_hz": get_field("ContentPlaceHolder1_lblFrequency"),
-        "source": get_text("ContentPlaceHolder1_lbl_chgsrc"),
-    }
+    Optional endpoints that fail are silently None (logged by the client);
+    critical endpoints raise and propagate out of ``main()``.
+    """
+    logger.info("Fetching meter data via API...")
+    responses = client.fetch_all()
+    historical = _fetch_historical_months()
+    result = normalize(responses, historical_months=historical)
+    logger.info(
+        f"Daily readings: {len(result[6])} days; "
+        f"Portal recharges: {len(result[11])} entries"
+    )
+    return result
 
 
 def _build_daily_spends(daily_readings, start_date, end_date):
@@ -2033,15 +1805,22 @@ def main():
     logger.info(f"Starting Energy Meter Scraper ({mode} mode)")
     logger.info("=" * 60)
 
-    if not CONFIG["USERNAME"] or not CONFIG["PASSWORD"]:
-        logger.error("SMARTGRID_USERNAME and SMARTGRID_PASSWORD must be set!")
+    if not (CONFIG["SITE_ID"] and CONFIG["UNIT_ID"] and CONFIG["METER_ID"]):
+        logger.error(
+            "SMARTGRID_SITE_ID, SMARTGRID_UNIT_ID, and SMARTGRID_METER_ID must be set. "
+            "Run scripts/bootstrap_ids.py once to resolve them from tower/flat."
+        )
         sys.exit(1)
 
     try:
-        session = create_session()
-        login(session)
-
-        balance, current_month, prev_day, prev_month, monthly_consumption, today, daily_readings, prev_prev_month, last_sync, rate_card, grace_credit, portal_recharges, electrical_params = scrape_meter_data(session)
+        # Client session is intentionally closed as soon as scrape_meter_data
+        # returns. Every downstream call (storage, alerts, Telegram, charts)
+        # operates on the materialized 13-tuple — nothing re-fetches. If you
+        # add a feature that re-polls an endpoint later in main(), move this
+        # `with` block to wrap the wider try-body or you'll hit a closed
+        # session.
+        with create_client() as client:
+            balance, current_month, prev_day, prev_month, monthly_consumption, today, daily_readings, prev_prev_month, last_sync, rate_card, grace_credit, portal_recharges, electrical_params = scrape_meter_data(client)
         duration = time.time() - start_time
 
         # ------------------------------------------------------------------

@@ -3,7 +3,7 @@
 ## Project Overview
 
 This is an energy meter monitoring system that:
-1. **Scrapes** data from a prepaid electricity meter portal (via HTTP, no browser)
+1. **Fetches** data from the SmartGridSoft prepaid-meter vendor's undocumented JSON API (reverse-engineered from their Android app; no auth required once three meter IDs are bootstrapped)
 2. **Snapshots** instantaneous power draw every 10 minutes (Phase 2)
 3. **Notifies** via Telegram bot (morning, afternoon, evening, weekly, monthly reports)
 4. **Alerts** on anomalies — daily (spikes, DG usage, rate changes, low balance) and real-time (heavy draw, sustained load, night anomalies)
@@ -14,7 +14,7 @@ This is an energy meter monitoring system that:
 
 | Component | Technology | Hosting |
 |-----------|------------|---------|
-| Scraper | Python + requests + BeautifulSoup | GitHub Actions (cron) |
+| Scraper | Python + requests (JSON API client) | GitHub Actions (cron) |
 | Notifications | Telegram Bot API | — |
 | Data Storage | Neon Postgres | Neon free tier |
 | Python Deps | uv | Local / CI |
@@ -28,11 +28,22 @@ energy-monitor/
 ├── migrations/
 │   ├── 001_initial_schema.sql  # Schema definitions (numbered SQL files)
 │   └── migrate.py              # Runs pending migrations against DATABASE_URL
+├── scripts/
+│   ├── bootstrap_ids.py        # One-shot: resolve SITE/UNIT/METER IDs from tower+flat
+│   └── probe_api.py            # Dump raw API responses to tests/fixtures/
 ├── scraper/
-│   ├── scraper.py              # Main scraper + Telegram messages + alerts
+│   ├── scraper.py              # Main orchestrator + Telegram messages + alerts
+│   ├── api_client.py           # SmartGridSoft JSON API client (13 endpoints)
+│   ├── normalizer.py           # API → 13-tuple adapter; preserves HTML-era contract
 │   ├── storage.py              # Postgres persistence layer (psycopg2)
 │   ├── charts.py               # Matplotlib chart/table image generators
-│   └── test_messages.py        # Test script for all message types
+│   └── test_messages.py        # Live-integration harness for all message types
+├── tests/
+│   ├── fixtures/               # Captured API responses (21 endpoints)
+│   ├── golden/                 # Pinned Telegram message strings
+│   ├── test_api_client.py
+│   ├── test_normalizer.py
+│   └── test_messages_golden.py
 ├── pyproject.toml              # Python project config (uv)
 ├── uv.lock                     # Python dependency lockfile
 ├── .python-version             # Python version pin (3.11)
@@ -110,27 +121,33 @@ New schema changes go into `migrations/NNN_description.sql`. Run `uv run python 
 
 ### GitHub Secrets (PROD environment)
 
-All identifying values go in **Secrets** (auto-masked in public action logs) — not Variables, which render as plaintext. This matters because the repo is public.
+All identifying values go in **Secrets** (auto-masked in public action logs) — not Variables, which render as plaintext. This matters because the repo is public. The API itself has no auth; the three IDs below effectively identify a meter publicly on the vendor's server, but as secrets they at least stay out of action logs.
 
-- `SMARTGRID_COMPANY` - Portal company / society name
-- `SMARTGRID_USERNAME` - Portal username / unit ID
-- `SMARTGRID_PASSWORD` - Portal password
-- `TELEGRAM_BOT_TOKEN` - Telegram bot token
-- `TELEGRAM_CHAT_ID` - Telegram chat ID
-- `DATABASE_URL` - Neon Postgres connection string
+Runtime secrets:
+- `SMARTGRID_SITE_ID` — society identifier from `GetSocietyName`
+- `SMARTGRID_UNIT_ID` — from `GetLogin`
+- `SMARTGRID_METER_ID` — from `GetLogin`
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+- `DATABASE_URL` — Neon Postgres connection string
+
+Bootstrap-only (local `.env`, not needed in GHA):
+- `SMARTGRID_COMPANY` / `SMARTGRID_TOWER` / `SMARTGRID_FLAT` — used by `scripts/bootstrap_ids.py` to resolve the three runtime IDs above
 
 ### Optional (env vars or .env)
 
 - `LOG_LEVEL` - Logging verbosity (default: INFO). Set to `DEBUG` locally to see balance/power values in logs; leave at INFO for CI since those values would land in public logs.
-- `LOW_BALANCE_THRESHOLD` - Static low balance alert (default: 800)
 - `MONTHLY_BUDGET` - Monthly budget for tracking (default: 8000)
 - `SPIKE_THRESHOLD` - Consumption spike multiplier (default: 1.5)
 
 ## Local Development
 
 ```bash
-uv sync                                      # Install deps
-cp .env.example .env                         # Configure credentials + DATABASE_URL
+uv sync --extra dev                          # Install runtime + test deps
+cp .env.example .env                         # Configure IDs + DATABASE_URL + Telegram
+
+# First-time only: resolve the three meter IDs from tower + flat.
+uv run python scripts/bootstrap_ids.py --society "Your Society" --tower "A" --flat "101"
 
 uv run python migrations/migrate.py          # Create/update tables
 uv run python scraper/scraper.py             # Morning report
@@ -141,6 +158,7 @@ uv run python scraper/scraper.py --weekly    # + Weekly report
 uv run python scraper/scraper.py --monthly   # + Monthly report
 
 uv run python scraper/test_messages.py       # Send all message types
+uv run pytest tests/ -v                      # Unit + contract + golden tests
 ```
 
 ## Troubleshooting

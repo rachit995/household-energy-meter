@@ -556,6 +556,43 @@ def extract_recharges(daily_readings):
     return recharges
 
 
+_MONTH_NAMES_FOR_LABEL = (
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
+
+
+def load_historical_months(older_than_month, count=4):
+    """Read the ``monthly_summaries`` table for months strictly older than
+    ``older_than_month`` (format ``YYYY-MM``), newest-first, up to ``count``
+    rows. Returns ``[{"month": "<Month-YYYY>", "amount": Decimal|None}, ...]``
+    formatted for the monthly-consumption chart.
+
+    Used by the API-era scraper to pad the ``monthly_consumption`` list from
+    2 (prev + prev-prev, API-sourced) up to 6 months for the trend chart.
+    """
+    conn = _get_conn()
+    with conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT month, total
+                FROM monthly_summaries
+                WHERE month < %s
+                ORDER BY month DESC
+                LIMIT %s
+                """,
+                (older_than_month, count),
+            )
+            rows = cur.fetchall()
+    out = []
+    for r in rows:
+        year_str, month_str = r["month"].split("-")
+        label = f"{_MONTH_NAMES_FOR_LABEL[int(month_str) - 1]}-{year_str}"
+        out.append({"month": label, "amount": r["total"]})
+    return out
+
+
 # =============================================================================
 # Phase 2: High-frequency readings + edge-triggered alert cooldowns
 # =============================================================================

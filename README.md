@@ -1,12 +1,12 @@
 # Energy Monitor
 
-A self-hosted energy meter monitoring system that scrapes a prepaid electricity meter portal and sends reports via Telegram.
+A self-hosted energy meter monitoring system that reads a prepaid electricity meter via the vendor's mobile-app JSON API and sends reports via Telegram.
 
 ## Stack
 
 | Component | Technology | Hosting |
 |-----------|------------|---------|
-| Scraper | Python + requests + BeautifulSoup | GitHub Actions (cron) |
+| Scraper | Python + requests (undocumented vendor JSON API) | GitHub Actions (cron) |
 | Notifications | Telegram Bot API | — |
 | Data Storage | Neon Postgres | Neon free tier |
 | Python Deps | uv | Local / CI |
@@ -67,27 +67,38 @@ A self-hosted energy meter monitoring system that scrapes a prepaid electricity 
 
 ```bash
 uv sync                              # Install deps
-cp .env.example .env                 # Fill in credentials + DATABASE_URL
+cp .env.example .env                 # Fill in IDs + DATABASE_URL
 
 uv run python migrations/migrate.py  # Create tables
 ```
 
-### 4. Configure GitHub Repository
+### 4. Bootstrap the Meter IDs
 
-Public repos have public Action logs. To avoid leaking identifying values, **all six** settings go in **Secrets** (auto-masked) rather than Variables (plaintext in logs).
+The vendor API needs three identifiers on every call: `SMARTGRID_SITE_ID` (society), `SMARTGRID_UNIT_ID`, and `SMARTGRID_METER_ID`. They're static per flat and only need to be resolved once. The bootstrap script derives all three from your society/tower/flat:
+
+```bash
+uv run python scripts/bootstrap_ids.py \
+  --society "<your society>" --tower "<tower>" --flat "<flat>"
+```
+
+Copy the three `SMARTGRID_*` lines it prints into `.env` and into the GitHub secrets below.
+
+### 5. Configure GitHub Repository
+
+Public repos have public Action logs. To avoid leaking identifying values, every secret below is stored as an **encrypted Secret** (auto-masked in logs) rather than a Variable (plaintext in logs).
 
 Go to **Settings** > **Secrets and variables** > **Actions** and add these under **Secrets**:
 
 | Secret | Value |
 |--------|-------|
-| `SMARTGRID_COMPANY` | Portal company / society name |
-| `SMARTGRID_USERNAME` | Portal username / unit ID |
-| `SMARTGRID_PASSWORD` | Portal password |
+| `SMARTGRID_SITE_ID` | Society ID from `bootstrap_ids.py` |
+| `SMARTGRID_UNIT_ID` | Unit ID from `bootstrap_ids.py` |
+| `SMARTGRID_METER_ID` | Meter ID from `bootstrap_ids.py` |
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token |
 | `TELEGRAM_CHAT_ID` | Telegram chat ID |
 | `DATABASE_URL` | Neon Postgres connection string |
 
-### 5. Enable GitHub Actions
+### 6. Enable GitHub Actions
 
 The workflow runs automatically on schedule. To test manually:
 
@@ -117,18 +128,23 @@ uv run python scraper/test_messages.py       # Send all message types
 ```
 energy-monitor/
 ├── .github/workflows/
-│   └── scraper.yml        # Cron: morning + afternoon + evening + weekly + monthly
+│   └── scraper.yml           # Cron: morning + afternoon + evening + weekly + monthly
 ├── migrations/
-│   ├── 001_initial_schema.sql  # Schema definitions
-│   └── migrate.py         # Run pending migrations against DATABASE_URL
+│   ├── 001_initial_schema.sql
+│   └── migrate.py            # Run pending migrations against DATABASE_URL
+├── scripts/
+│   ├── bootstrap_ids.py      # One-shot: society/tower/flat → SITE/UNIT/METER IDs
+│   └── probe_api.py          # Dump raw API responses for fixture capture
 ├── scraper/
-│   ├── scraper.py         # Main scraper + Telegram messages + alerts
-│   ├── storage.py         # Postgres persistence layer
-│   ├── charts.py          # Matplotlib chart/table image generators
-│   └── test_messages.py   # Test script for all message types
-├── pyproject.toml         # Python project config (uv)
-├── uv.lock                # Python dependency lockfile
-└── .python-version        # Python version pin (3.11)
+│   ├── scraper.py            # Orchestrator + Telegram messages + alert engine
+│   ├── api_client.py         # Vendor JSON API client (13 endpoints)
+│   ├── normalizer.py         # API → internal contract adapter
+│   ├── storage.py            # Postgres persistence layer
+│   ├── charts.py             # Matplotlib chart/table image generators
+│   └── test_messages.py      # Live-integration harness for all message types
+├── pyproject.toml            # Python project config (uv)
+├── uv.lock
+└── .python-version           # Python version pin (3.11)
 ```
 
 ## Data Storage
