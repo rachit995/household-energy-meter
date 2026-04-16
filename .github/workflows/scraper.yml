@@ -1,0 +1,123 @@
+name: Energy Meter Scraper
+
+on:
+  # Report runs:
+  #   Morning:   1:00 AM UTC  (6:30 AM IST)
+  #   Afternoon: 12:00 PM UTC (5:30 PM IST)
+  #   Evening:   4:30 PM UTC  (10:00 PM IST)
+  #
+  # Snapshot runs (Phase 2): every 10 minutes, offset by 5 to avoid colliding
+  # with the report crons on :00 and :30. Each snapshot saves one row to the
+  # `readings` table and runs the edge-triggered alert engine.
+  schedule:
+    - cron: '5,15,25,35,45,55 * * * *'
+    - cron: '0 1 * * *'
+    - cron: '0 12 * * *'
+    - cron: '30 16 * * *'
+
+  # Allow manual trigger from Actions tab
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Scraper mode'
+        required: false
+        default: 'morning'
+        type: choice
+        options:
+          - morning
+          - afternoon
+          - evening
+          - snapshot
+      weekly:
+        description: 'Include weekly report'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      monthly:
+        description: 'Include monthly report'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+permissions:
+  contents: read
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    environment: PROD
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Determine scraper mode
+        id: mode
+        # Map the triggering event/schedule to a SCRAPER_MODE. The snapshot
+        # cron (every 10 min, offset to :05/:15/.../:55) never collides with
+        # the report crons on :00 or :30, so these branches are disjoint.
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "mode=${{ github.event.inputs.mode }}" >> $GITHUB_OUTPUT
+            echo "weekly=${{ github.event.inputs.weekly }}" >> $GITHUB_OUTPUT
+            echo "monthly=${{ github.event.inputs.monthly }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.schedule }}" = "5,15,25,35,45,55 * * * *" ]; then
+            # Phase 2: 10-min snapshot. Saves one readings row, runs the
+            # alert engine, no reports or daily-aggregate churn.
+            echo "mode=snapshot" >> $GITHUB_OUTPUT
+            echo "weekly=false" >> $GITHUB_OUTPUT
+            echo "monthly=false" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.schedule }}" = "0 12 * * *" ]; then
+            echo "mode=afternoon" >> $GITHUB_OUTPUT
+            echo "weekly=false" >> $GITHUB_OUTPUT
+            echo "monthly=false" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.schedule }}" = "30 16 * * *" ]; then
+            echo "mode=evening" >> $GITHUB_OUTPUT
+            echo "weekly=false" >> $GITHUB_OUTPUT
+            echo "monthly=false" >> $GITHUB_OUTPUT
+          else
+            echo "mode=morning" >> $GITHUB_OUTPUT
+            # Send weekly report on Mondays
+            if [ "$(date -u +%u)" = "1" ]; then
+              echo "weekly=true" >> $GITHUB_OUTPUT
+            else
+              echo "weekly=false" >> $GITHUB_OUTPUT
+            fi
+            # Send monthly report on 1st of month
+            if [ "$(date -u +%d)" = "01" ]; then
+              echo "monthly=true" >> $GITHUB_OUTPUT
+            else
+              echo "monthly=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Run scraper
+        # All user-identifying/PII values are passed as SECRETS (auto-masked
+        # in public action logs). GitHub Actions Variables would render as
+        # plaintext in logs — avoid for anything that could identify a user.
+        env:
+          SMARTGRID_COMPANY: ${{ secrets.SMARTGRID_COMPANY }}
+          SMARTGRID_USERNAME: ${{ secrets.SMARTGRID_USERNAME }}
+          SMARTGRID_PASSWORD: ${{ secrets.SMARTGRID_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SCRAPER_MODE: ${{ steps.mode.outputs.mode }}
+          WEEKLY: ${{ steps.mode.outputs.weekly }}
+          MONTHLY: ${{ steps.mode.outputs.monthly }}
+        run: uv run python scraper/scraper.py

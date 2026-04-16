@@ -1,0 +1,47 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Build outputs
+dist/
+build/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+scraper.log
+
+# Error screenshots / generated images
+*.png
+
+# Vercel
+.vercel/
+
+# Testing
+coverage/
+.pytest_cache/
+.omc/
+
+# Local dev artifacts
+.claude/
+.agents/
+data/
+debug/
