@@ -51,7 +51,6 @@ permissions:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    environment: PROD
 
     steps:
       - name: Checkout code
