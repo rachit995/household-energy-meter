@@ -8,6 +8,7 @@ A self-hosted energy meter monitoring system that reads a prepaid electricity me
 |-----------|------------|---------|
 | Scraper | Python + requests (undocumented vendor JSON API) | GitHub Actions (cron) |
 | Notifications | Telegram Bot API | — |
+| Error Monitoring | Sentry (cron monitors + exception capture) | Sentry free tier |
 | Data Storage | Neon Postgres | Neon free tier |
 | Python Deps | uv | Local / CI |
 
@@ -97,6 +98,7 @@ Go to **Settings** > **Secrets and variables** > **Actions** and add these under
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token |
 | `TELEGRAM_CHAT_ID` | Telegram chat ID |
 | `DATABASE_URL` | Neon Postgres connection string |
+| `SENTRY_DSN` | *(optional)* Sentry project DSN for private error monitoring + cron health |
 
 ### 6. Enable GitHub Actions
 

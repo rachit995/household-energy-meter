@@ -32,8 +32,50 @@ from normalizer import normalize
 load_dotenv()
 from datetime import date, datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
+import re
+import sentry_sdk
 
 IST = timezone(timedelta(hours=5, minutes=30))
+
+# ---------------------------------------------------------------------------
+# Sentry — private error monitoring (public GHA logs can't show tracebacks)
+# ---------------------------------------------------------------------------
+_SECRET_PATTERNS = re.compile(
+    r"postgres(?:ql)?://[^\s'\"]+|"        # DATABASE_URL (postgresql:// or postgres://)
+    r"bot\d+:[A-Za-z0-9_-]+|"             # Telegram bot token
+    r"password=[^\s&'\"]+|"                # libpq-style password=...
+    r"Bearer\s+[A-Za-z0-9._-]+|"          # Authorization bearer tokens
+    r"token=[A-Za-z0-9._-]+|"             # generic token= params
+    r"api[_-]?key=[A-Za-z0-9._-]+"        # generic api_key= / apikey= params
+)
+
+
+def _scrub_strings(obj):
+    """Recursively scrub secret patterns from every string in a nested
+    dict/list structure. Covers exception values, breadcrumbs, extra,
+    contexts, and frame local variables."""
+    if isinstance(obj, str):
+        return _SECRET_PATTERNS.sub("<redacted>", obj)
+    if isinstance(obj, dict):
+        return {k: _scrub_strings(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_scrub_strings(v) for v in obj]
+    return obj
+
+
+def _scrub_event(event, hint):
+    """Walk the entire Sentry event payload and strip secrets."""
+    return _scrub_strings(event)
+
+
+sentry_sdk.init(
+    dsn=os.getenv("SENTRY_DSN"),          # empty/unset → SDK disables itself
+    environment=os.getenv("SENTRY_ENVIRONMENT", "production"),
+    release=os.getenv("GITHUB_SHA"),       # auto-set by GHA; tags errors by commit
+    before_send=_scrub_event,
+    traces_sample_rate=0,                  # no tracing — short-lived script
+)
+
 
 # Configure logging.
 #
@@ -1812,6 +1854,24 @@ def main():
         )
         sys.exit(1)
 
+    # --- Sentry Cron Monitoring -------------------------------------------
+    # Tracks that each scheduled mode actually runs on time. If a cron tick
+    # is missed (GHA outage, quota exhaustion, runner failure), Sentry alerts
+    # before the user has to notice that Telegram went silent.
+    # Schedules match .github/workflows/scraper.yml (UTC).
+    from sentry_sdk.crons import monitor as sentry_monitor
+    _CRON_CONFIGS = {
+        "snapshot":  {"schedule": {"type": "crontab", "value": "5,15,25,35,45,55 * * * *"}, "checkin_margin": 5, "max_runtime": 5},
+        "morning":   {"schedule": {"type": "crontab", "value": "0 1 * * *"},               "checkin_margin": 10, "max_runtime": 5},
+        "afternoon": {"schedule": {"type": "crontab", "value": "0 12 * * *"},              "checkin_margin": 10, "max_runtime": 5},
+        "evening":   {"schedule": {"type": "crontab", "value": "30 16 * * *"},             "checkin_margin": 10, "max_runtime": 5},
+    }
+    _monitor_ctx = sentry_monitor(
+        monitor_slug=f"energy-{mode}",
+        monitor_config=_CRON_CONFIGS.get(mode),
+    )
+    _monitor_ctx.__enter__()
+
     try:
         # Client session is intentionally closed as soon as scrape_meter_data
         # returns. Every downstream call (storage, alerts, Telegram, charts)
@@ -1858,6 +1918,8 @@ def main():
             _run_alert_engine(current_reading, now_ist)
 
             duration = time.time() - start_time
+            _monitor_ctx.__exit__(None, None, None)
+            sentry_sdk.flush(timeout=5)
             logger.info(f"Snapshot finished in {duration:.2f}s")
             return
 
@@ -2060,18 +2122,23 @@ def main():
         # token) in their str representation. Telegram message history is
         # synced across the user's devices and third-party cloud, so even
         # a "private chat" is not a safe secrets sink. Send ONLY the
-        # exception type and a short static hint — check the raw log
-        # locally (LOG_LEVEL=DEBUG + `uv run scraper.py`) for detail.
+        # exception type and a short static hint — full traceback goes to
+        # Sentry (private dashboard) where it's scrubbed of secrets.
         logger.error(f"Fatal error: {type(e).__name__}")
+        _monitor_ctx.__exit__(type(e), e, e.__traceback__)
+        sentry_sdk.capture_exception(e)
         duration = time.time() - start_time
         send_telegram_message(
             "🚨 <b>Energy Scraper — Failed</b>\n\n"
             f"Error type: {type(e).__name__}\n"
             f"Duration: {duration:.1f}s\n"
-            f"Check Action logs for details."
+            f"Check Sentry dashboard for full traceback."
         )
+        sentry_sdk.flush(timeout=5)
         sys.exit(1)
 
+    _monitor_ctx.__exit__(None, None, None)
+    sentry_sdk.flush(timeout=5)
     logger.info(f"Scraper finished in {duration:.2f} seconds")
 
 

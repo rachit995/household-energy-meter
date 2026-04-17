@@ -14,7 +14,7 @@ This is an energy meter monitoring system that:
 
 | Component | Technology | Hosting |
 |-----------|------------|---------|
-| Scraper | Python + requests (JSON API client) | GitHub Actions (cron) |
+| Scraper | Python + requests (JSON API client) + Sentry | GitHub Actions (cron) |
 | Notifications | Telegram Bot API | — |
 | Data Storage | Neon Postgres | Neon free tier |
 | Python Deps | uv | Local / CI |
@@ -137,6 +137,8 @@ Bootstrap-only (local `.env`, not needed in GHA):
 ### Optional (env vars or .env)
 
 - `LOG_LEVEL` - Logging verbosity (default: INFO). Set to `DEBUG` locally to see balance/power values in logs; leave at INFO for CI since those values would land in public logs.
+- `SENTRY_DSN` - Sentry project DSN for private error monitoring (leave empty to disable; free tier at sentry.io, 5K errors/month)
+- `SENTRY_ENVIRONMENT` - Sentry environment tag (default: `production`)
 - `MONTHLY_BUDGET` - Monthly budget for tracking (default: 8000)
 - `SPIKE_THRESHOLD` - Consumption spike multiplier (default: 1.5)
 
