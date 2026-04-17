@@ -4,7 +4,7 @@
 
 This is an energy meter monitoring system that:
 1. **Fetches** data from the SmartGridSoft prepaid-meter vendor's undocumented JSON API (reverse-engineered from their Android app; no auth required once three meter IDs are bootstrapped)
-2. **Snapshots** instantaneous power draw every 10 minutes (Phase 2)
+2. **Snapshots** instantaneous power draw every 20 minutes (Phase 2)
 3. **Notifies** via Telegram bot (morning, afternoon, evening, weekly, monthly reports)
 4. **Alerts** on anomalies — daily (spikes, DG usage, rate changes, low balance) and real-time (heavy draw, sustained load, night anomalies)
 5. **Stores** historical data in Neon Postgres
@@ -54,7 +54,7 @@ energy-monitor/
 
 | Mode | Schedule | Content |
 |------|----------|---------|
-| Snapshot | Every 10 min (`:05,:15,:25,:35,:45,:55`) | Saves instantaneous power draw + balance to `readings` table; runs edge-triggered alerts; no Telegram unless an alert fires |
+| Snapshot | Every 20 min (`:05,:25,:45`) | Saves instantaneous power draw + balance to `readings` table; runs edge-triggered alerts; no Telegram unless an alert fires |
 | Morning | 6:30 AM IST daily | Balance, yesterday's deductions vs 7d avg & last week, current month, balance runway |
 | Afternoon | 5:30 PM IST daily | Live power draw, DG/EB source, today's spend + projection, budget pace |
 | Evening | 10:00 PM IST daily | Balance, today's deductions, balance runway, 14-day spend trend chart, **24h power profile chart** (Phase 2) |
@@ -99,7 +99,7 @@ Data lives in Neon Postgres. 7 tables plus a `schema_migrations` tracker.
 - **`portal_recharges`** — snapshot of portal's "Last 10 Recharges", full replace each run
 - **`rates`** — rate card history, append-only on change
 
-**Phase 2 (10-min high-frequency data):**
+**Phase 2 (20-min high-frequency data):**
 - **`readings`** (BIGSERIAL PK, indexed on `recorded_at DESC`) — one row per snapshot run with instantaneous power, voltage, current, PF, frequency, source, balance. NULL power values are preserved (not defaulted to 0).
 - **`alert_state`** (PK `alert_type`) — last-fire timestamp + JSONB context per alert type; used by the edge-triggered alert engine to enforce cooldowns across stateless GHA runs.
 
@@ -155,7 +155,7 @@ uv run python migrations/migrate.py          # Create/update tables
 uv run python scraper/scraper.py             # Morning report
 uv run python scraper/scraper.py --afternoon # Afternoon check-in
 uv run python scraper/scraper.py --evening   # Evening report (includes 24h power profile chart)
-uv run python scraper/scraper.py --snapshot  # 10-min snapshot + edge-triggered alert check
+uv run python scraper/scraper.py --snapshot  # 20-min snapshot + edge-triggered alert check
 uv run python scraper/scraper.py --weekly    # + Weekly report
 uv run python scraper/scraper.py --monthly   # + Monthly report
 

@@ -18,7 +18,7 @@ A self-hosted energy meter monitoring system that reads a prepaid electricity me
 
 | Mode | Schedule | Content |
 |------|----------|---------|
-| Snapshot | Every 10 min (`:05,:15,...,:55`) | Saves instantaneous power + balance to `readings`; runs real-time alerts; no Telegram unless an alert fires |
+| Snapshot | Every 20 min (`:05,:25,:45`) | Saves instantaneous power + balance to `readings`; runs real-time alerts; no Telegram unless an alert fires |
 | Morning | 6:30 AM IST daily | Balance, yesterday's deductions vs 7d avg & last week, current month, balance runway |
 | Afternoon | 5:30 PM IST daily | Live power draw, DG/EB source, today's spend + projection, budget pace |
 | Evening | 10:00 PM IST daily | Balance, today's deductions, balance runway, 14-day spend trend chart, 24h power profile chart |
@@ -42,7 +42,7 @@ A self-hosted energy meter monitoring system that reads a prepaid electricity me
 | Spending Trend | Periodic trend check (days 7/14/21/28) | Evening |
 | Partial Day Spike | Today's partial spend already exceeds yesterday | Afternoon |
 
-**Real-time alerts** (run every 10-min snapshot — edge-triggered with cooldowns):
+**Real-time alerts** (run every 20-min snapshot — edge-triggered with cooldowns):
 
 | Alert | Trigger | Cooldown |
 |-------|---------|----------|
@@ -118,7 +118,7 @@ uv run python migrations/migrate.py          # Create/update tables
 uv run python scraper/scraper.py             # Morning report
 uv run python scraper/scraper.py --afternoon # Afternoon check-in
 uv run python scraper/scraper.py --evening   # Evening report (includes 24h power profile chart)
-uv run python scraper/scraper.py --snapshot  # 10-min snapshot + edge-triggered alerts
+uv run python scraper/scraper.py --snapshot  # 20-min snapshot + edge-triggered alerts
 uv run python scraper/scraper.py --weekly    # + Weekly report
 uv run python scraper/scraper.py --monthly   # + Monthly report
 
@@ -190,7 +190,7 @@ Rate card history (EB rate, DG rate, daily fix charge). Append-only, only when r
 
 ### `readings` (Phase 2)
 
-Instantaneous snapshots — one row per 10-minute scrape. Columns include `recorded_at`, `active_power_kw`, `apparent_power_kva`, `current_amp`, `voltage_ln`/`voltage_ll`, `power_factor`, `frequency_hz`, `source`, and `balance`. Electrical parameters are NULL when the portal hasn't reported — stored as NULL rather than 0 (the alert engine skips NULL readings instead of treating them as "no draw"). Append-only. Indexed on `recorded_at DESC`.
+Instantaneous snapshots — one row per 20-minute scrape. Columns include `recorded_at`, `active_power_kw`, `apparent_power_kva`, `current_amp`, `voltage_ln`/`voltage_ll`, `power_factor`, `frequency_hz`, `source`, and `balance`. Electrical parameters are NULL when the portal hasn't reported — stored as NULL rather than 0 (the alert engine skips NULL readings instead of treating them as "no draw"). Append-only. Indexed on `recorded_at DESC`.
 
 ### `alert_state` (Phase 2)
 

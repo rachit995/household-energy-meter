@@ -1577,7 +1577,7 @@ NIGHT_ANOMALY_COOLDOWN_HOURS = 2
 MAX_PLAUSIBLE_POWER_KW = 50.0
 
 STALE_SYNC_WARN_MINUTES = 20          # Log a WARN if portal's last_sync is older than this
-RECHARGE_JUMP_THRESHOLD = 500         # Balance jump in a single 10-min window ≥ this triggers save_recharge
+RECHARGE_JUMP_THRESHOLD = 500         # Balance jump in a single 20-min window ≥ this triggers save_recharge
 
 
 def parse_last_sync(raw):
@@ -1758,7 +1758,7 @@ def _snapshot_recharge_detect(prev_reading, current_balance, now):
     call save_recharge() (which handles its own dedup against portal data).
 
     Runs only in snapshot mode — the 3x/day report runs already detect
-    balance-jump recharges from daily_readings, but at 10-min granularity
+    balance-jump recharges from daily_readings, but at 20-min granularity
     we can catch them near-real-time and surface the balance change in any
     alert context that might need it.
     """
@@ -1785,7 +1785,7 @@ def _build_load_profile_image(today_readings_ist):
     returns None if there aren't enough valid samples to draw a
     meaningful chart.
     """
-    MIN_SAMPLES_FOR_CHART = 6  # ~1 hour of 10-min data; arbitrary but avoids empty charts
+    MIN_SAMPLES_FOR_CHART = 6  # ~1 hour of 20-min data; arbitrary but avoids empty charts
 
     pts = [(r["recorded_at"], float(r["active_power_kw"]))
            for r in today_readings_ist
@@ -1821,7 +1821,7 @@ def main():
     parser.add_argument("--evening", action="store_true", help="Run evening report mode")
     parser.add_argument("--afternoon", action="store_true", help="Run afternoon check-in mode")
     parser.add_argument("--snapshot", action="store_true",
-                        help="High-frequency snapshot mode (10-min cron). Saves a reading, "
+                        help="High-frequency snapshot mode (20-min cron). Saves a reading, "
                              "runs the alert engine, skips the report flow.")
     parser.add_argument("--weekly", action="store_true", help="Include weekly report")
     parser.add_argument("--monthly", action="store_true", help="Include monthly report")
@@ -1861,7 +1861,7 @@ def main():
     # Schedules match .github/workflows/scraper.yml (UTC).
     from sentry_sdk.crons import monitor as sentry_monitor
     _CRON_CONFIGS = {
-        "snapshot":  {"schedule": {"type": "crontab", "value": "5,15,25,35,45,55 * * * *"}, "checkin_margin": 5, "max_runtime": 5},
+        "snapshot":  {"schedule": {"type": "crontab", "value": "5,25,45 * * * *"}, "checkin_margin": 10, "max_runtime": 5},
         "morning":   {"schedule": {"type": "crontab", "value": "0 1 * * *"},               "checkin_margin": 10, "max_runtime": 5},
         "afternoon": {"schedule": {"type": "crontab", "value": "0 12 * * *"},              "checkin_margin": 10, "max_runtime": 5},
         "evening":   {"schedule": {"type": "crontab", "value": "30 16 * * *"},             "checkin_margin": 10, "max_runtime": 5},

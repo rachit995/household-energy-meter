@@ -6,11 +6,12 @@ on:
   #   Afternoon: 12:00 PM UTC (5:30 PM IST)
   #   Evening:   4:30 PM UTC  (10:00 PM IST)
   #
-  # Snapshot runs (Phase 2): every 10 minutes, offset by 5 to avoid colliding
-  # with the report crons on :00 and :30. Each snapshot saves one row to the
-  # `readings` table and runs the edge-triggered alert engine.
+  # Snapshot runs (Phase 2): every 20 minutes. Originally 10-min, but GHA
+  # free-tier throttling delivers only ~2-3 runs/hour regardless. Switching
+  # to 20-min aligns with what GHA actually grants and reduces wasted queue
+  # pressure. Offset by 5 to avoid colliding with report crons on :00/:30.
   schedule:
-    - cron: '5,15,25,35,45,55 * * * *'
+    - cron: '5,25,45 * * * *'
     - cron: '0 1 * * *'
     - cron: '0 12 * * *'
     - cron: '30 16 * * *'
@@ -68,15 +69,15 @@ jobs:
       - name: Determine scraper mode
         id: mode
         # Map the triggering event/schedule to a SCRAPER_MODE. The snapshot
-        # cron (every 10 min, offset to :05/:15/.../:55) never collides with
+        # cron (every 20 min, offset to :05/:25/:45) never collides with
         # the report crons on :00 or :30, so these branches are disjoint.
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "mode=${{ github.event.inputs.mode }}" >> $GITHUB_OUTPUT
             echo "weekly=${{ github.event.inputs.weekly }}" >> $GITHUB_OUTPUT
             echo "monthly=${{ github.event.inputs.monthly }}" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event.schedule }}" = "5,15,25,35,45,55 * * * *" ]; then
-            # Phase 2: 10-min snapshot. Saves one readings row, runs the
+          elif [ "${{ github.event.schedule }}" = "5,25,45 * * * *" ]; then
+            # Phase 2: 20-min snapshot. Saves one readings row, runs the
             # alert engine, no reports or daily-aggregate churn.
             echo "mode=snapshot" >> $GITHUB_OUTPUT
             echo "weekly=false" >> $GITHUB_OUTPUT
