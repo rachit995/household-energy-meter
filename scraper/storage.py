@@ -336,6 +336,62 @@ def save_recharge(recharge_date, amount, balance_before, balance_after):
     logger.debug(f"Saved recharge: ₹{amt} on {d}")
 
 
+def last_recharge_date():
+    """Return the most recent recharge date in the unified ``recharges``
+    table, or None if the table is empty. Used by callers that want to
+    suppress advisory messaging right after a top-up (e.g., the Smart
+    Recharge Advisor)."""
+    conn = _get_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT MAX(date) FROM recharges")
+        row = cur.fetchone()
+    if not row or row[0] is None:
+        return None
+    return row[0]
+
+
+def claim_portal_recharge_notification(recharge):
+    """Atomic single-run claim for sending a portal recharge notification.
+
+    Concurrency context: GitHub Actions cron can fire snapshot workflows
+    back-to-back (observed seconds apart after throttling catches up). Each
+    run independently pulls ``BindRecharge``, detects the newest entry as
+    ``new``, and would otherwise send duplicate Telegram messages + chart
+    images. The previous design (save-after-send) left a 10-15s race window
+    covering the two photo uploads.
+
+    This helper races a single atomic INSERT with ``ON CONFLICT DO NOTHING``
+    on the ``recharges`` table's ``UNIQUE (date, amount)`` constraint. The
+    winner gets back the new row id and proceeds to send. Losers get None
+    and skip the notification, still letting the rest of the merge/cleanup/
+    save pipeline run idempotently.
+
+    Takes the raw portal recharge dict (``{date, amount, type, ...}``). Date
+    is normalized to a ``date`` object. Source is tagged ``'portal'`` to
+    match the subsequent ``merge_portal_recharges_to_history`` path — which
+    will see the row already present and skip it on its own run.
+    """
+    rdate = recharge["date"]
+    if isinstance(rdate, str):
+        rdate = datetime.strptime(rdate, "%Y-%m-%d").date()
+    amount = float(recharge["amount"])
+
+    conn = _get_conn()
+    with conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO recharges (date, amount, balance_before, balance_after, source)
+                VALUES (%s, %s, NULL, NULL, 'portal')
+                ON CONFLICT (date, amount) DO NOTHING
+                RETURNING id
+                """,
+                (rdate, amount),
+            )
+            row = cur.fetchone()
+    return row is not None
+
+
 def merge_portal_recharges_to_history(portal_recharges):
     """Append portal recharges into the unified recharges table.
     ₹1 tolerance dedup. Sets source='portal', balance_before/after=NULL."""
@@ -778,4 +834,15 @@ def set_alert_state(alert_type, fired_at, context=None):
             )
     # Context contains power/balance values — emit at DEBUG only.
     logger.debug(f"alert_state[{alert_type}] fired @ {fired_at.isoformat()} context={context}")
-    logger.info(f"alert_state[{alert_type}] fired")
+
+
+def clear_alert_state(alert_type):
+    """Remove the last-fire record for an alert type. Used when an
+    edge-triggered condition clears (e.g., sync_stuck resumes) so the
+    next occurrence fires a fresh first-alert instead of continuing
+    the exponential backoff."""
+    conn = _get_conn()
+    with conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM alert_state WHERE alert_type = %s", (alert_type,))
+    logger.info(f"alert_state[{alert_type}] cleared")

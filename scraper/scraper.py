@@ -20,9 +20,10 @@ import requests
 from storage import (save_daily, save_daily_costs, save_monthly, save_recharge, save_rates, extract_recharges,
                       save_portal_recharges, load_portal_recharges, detect_new_recharges, merge_portal_recharges_to_history,
                       cleanup_duplicate_recharges, load_daily_readings, load_historical_months,
+                      claim_portal_recharge_notification, last_recharge_date,
                       # Phase 2: high-frequency readings + edge-triggered alerts
                       save_reading, load_readings, load_previous_reading,
-                      get_alert_state, set_alert_state)
+                      get_alert_state, set_alert_state, clear_alert_state)
 from charts import (render_table_image, render_bar_chart, render_spend_chart,
                      render_donut_chart, render_line_chart, render_grouped_bars,
                      render_time_profile_chart)
@@ -472,15 +473,59 @@ def build_recharge_alert(prediction, balance):
     )
 
 
-def build_recharge_analysis(new_recharges, all_recharges, balance, daily_readings):
-    """Build recharge analysis Telegram message when a new recharge is detected."""
-    newest = new_recharges[0]
-    today_date = date.today()
+def build_recharge_analysis(new_recharges, all_recharges, balance, daily_readings, effectiveness=None, now=None):
+    """Build recharge analysis Telegram message when a new recharge is detected.
 
-    msg = (
+    ``effectiveness`` is the precomputed output of
+    ``_compute_recharge_effectiveness``. When provided, the header frames the
+    message as an "Early Top-up" if the newest recharge happened while
+    substantial balance remained, mirroring the color-coded chart.
+
+    ``now`` is an IST-aware datetime captured by the caller. Using a single
+    ``now`` prevents off-by-one-day drift if the computation straddles
+    midnight, and avoids the silent ``date.today()``-in-UTC bug on GHA
+    runners.
+    """
+    newest = new_recharges[0]
+    if now is None:
+        now = datetime.now(IST)
+    today_date = now.date()
+
+    # Header — branches on whether the newest recharge was early.
+    newest_info = effectiveness[0] if effectiveness else None
+    header = (
         "🔋 <b>Recharge Detected!</b>\n\n"
-        f"💳 ₹{newest['amount']:,.0f} via {newest.get('type', '—')}\n\n"
+        f"💳 ₹{newest['amount']:,.0f} via {newest.get('type', '—')}\n"
     )
+    if newest_info and newest_info["is_early"] and newest_info["balance_before"] is not None:
+        bal_before = newest_info["balance_before"]
+        # Runway: use a 7-day rolling avg for the projection — the ongoing
+        # recharge doesn't have its own closed burn-rate window yet.
+        week_ago = today_date - timedelta(days=7)
+        _, cd = _build_daily_spends(daily_readings or [], week_ago, today_date)
+        recent_avg = (sum(float(d["spend"]) for d in cd) / len(cd)) if cd else None
+        runway_str = ""
+        if recent_avg and recent_avg > 0:
+            runway_days = int(bal_before / recent_avg)
+            runway_str = f" (~{runway_days} days runway)"
+        header = (
+            "🔋 <b>Early Top-up Detected!</b>\n\n"
+            f"💳 ₹{newest['amount']:,.0f} via {newest.get('type', '—')}\n"
+            f"💡 ₹{bal_before:,.0f} still on meter{runway_str}\n"
+        )
+
+    msg = header + "\n"
+
+    # Previous recharge runtime — when effectiveness data is available, show
+    # the honest "lasted Xd at ₹Y/day" line for the recharge that was just
+    # superseded.
+    if effectiveness and len(effectiveness) > 1:
+        prev = effectiveness[1]
+        if prev["effective_runtime"] is not None and prev["avg_daily_spend"] is not None:
+            msg += (
+                f"<b>Previous ₹{prev['amount']:,.0f}</b>\n"
+                f"  Lasted: {prev['effective_runtime']:.0f}d at ₹{prev['avg_daily_spend']:.0f}/day\n\n"
+            )
 
     # Compute intervals between consecutive recharges (sorted newest first)
     intervals = []
@@ -606,16 +651,29 @@ def _build_wow_line(daily_readings):
     )
 
 
-def build_recharge_advisor(balance, daily_readings, new_recharges):
-    """Prescriptive recharge advice: how much to recharge to last until month-end."""
+def build_recharge_advisor(balance, daily_readings, now=None):
+    """Prescriptive recharge advice: how much to recharge to last until month-end.
+
+    Suppressed when a recharge happened in the last ``_ADVISOR_POST_RECHARGE_DAYS``
+    (queried from the ``recharges`` table). The old signature took a
+    ``new_recharges`` list from the evening path's in-memory detection; that
+    path now runs in snapshot mode, so evening-time detection always returns
+    ``[]``. Querying the persisted recharges table is the authoritative
+    "was there a recent top-up" check and covers any caller.
+    """
     import calendar
 
-    if new_recharges:
-        return None
     if balance is None or balance <= 0:
         return None
 
-    today_date = date.today()
+    if now is None:
+        now = datetime.now(IST)
+    today_date = now.date()
+
+    last_rc = last_recharge_date()
+    if last_rc is not None and (today_date - last_rc).days <= _ADVISOR_POST_RECHARGE_DAYS:
+        return None
+
     week_ago = today_date - timedelta(days=7)
     _, consumption_days = _build_daily_spends(daily_readings, week_ago, today_date)
 
@@ -1000,32 +1058,211 @@ def _build_monthly_trend_image(monthly_consumption):
     )
 
 
-def _build_recharge_intervals_image(all_recharges, intervals):
-    """Chart 7: How long each recharge lasted as horizontal bars."""
-    if not all_recharges or not intervals:
+def _balance_before_recharge(recharge_date, daily_readings):
+    """Opening balance on the recharge day = pre-recharge balance.
+
+    Daily readings store ``amount_total`` as the portal's midnight snapshot,
+    so the row dated ``recharge_date`` is the balance immediately before any
+    same-day top-up. Returns None when the date isn't in daily_readings
+    (e.g., recharge happened before our data window).
+
+    Normalizes each row's ``date`` field to a ``date`` object before
+    comparison — psycopg2 returns ``date`` but an in-memory normalizer result
+    can be either, and a silent type mismatch would return None for every
+    row and all bars would render ``bal ?``.
+    """
+    for r in daily_readings or []:
+        r_date = r.get("date")
+        if isinstance(r_date, str):
+            try:
+                r_date = datetime.strptime(r_date, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+        if r_date == recharge_date and r.get("balance") is not None:
+            return float(r["balance"])
+    return None
+
+
+def _compute_recharge_effectiveness(all_recharges, daily_readings, now=None):
+    """For each recharge, compute:
+      - interval_days: calendar days until the next (newer) recharge, or
+        days-since for the ongoing newest recharge.
+      - avg_daily_spend: mean consumption-day spend within that window
+        (recharge day itself excluded; `_build_daily_spends` already drops
+        negative-spend rows i.e. top-up days).
+      - effective_runtime: amount / avg_daily_spend — the days this recharge
+        would have lasted at the observed burn rate. Industry-standard
+        "energy purchased per recharge" metric that stays accurate across
+        early top-ups.
+      - balance_before: opening balance on the recharge day.
+      - is_early: balance_before > 3 × classification_rate. ``classification_rate``
+        is ``avg_daily_spend`` when available, else a 7-day rolling mean ending
+        the day before the recharge. Falling back covers the ongoing newest
+        recharge (no closed window) and back-to-back recharges where the window
+        has < 3 consumption days.
+      - is_negative: balance_before < 0 (recharged during grace period).
+
+    Today-date baseline: takes an optional ``now`` (IST-aware datetime). Using
+    a single caller-supplied ``now`` avoids mid-computation day rollover and
+    the ``date.today()``-runs-in-UTC bug on GHA runners (where the wall-clock
+    date is 5:30h ahead of IST during the early-morning hours).
+
+    Returns list aligned with ``all_recharges`` (newest first). Fields are
+    None when underlying data is missing — callers must check.
+    """
+    if now is None:
+        now = datetime.now(IST)
+    today_date = now.date()
+    results = []
+
+    for i, r in enumerate(all_recharges):
+        r_date = r["date"] if isinstance(r["date"], date) else datetime.strptime(r["date"], "%Y-%m-%d").date()
+        amount = float(r["amount"])
+
+        if i == 0:
+            interval_days = max((today_date - r_date).days, 0)
+            window_end = today_date
+            is_ongoing = True
+        else:
+            prev = all_recharges[i - 1]
+            prev_date = prev["date"] if isinstance(prev["date"], date) else datetime.strptime(prev["date"], "%Y-%m-%d").date()
+            interval_days = max((prev_date - r_date).days, 0)
+            window_end = prev_date - timedelta(days=1)
+            is_ongoing = False
+
+        window_start = r_date + timedelta(days=1)
+        if window_start <= window_end:
+            _, consumption_days = _build_daily_spends(daily_readings or [], window_start, window_end)
+        else:
+            consumption_days = []
+
+        if len(consumption_days) >= 3:
+            avg_spend = sum(float(d["spend"]) for d in consumption_days) / len(consumption_days)
+            effective_runtime = amount / avg_spend if avg_spend > 0 else None
+        else:
+            avg_spend = None
+            effective_runtime = None
+
+        balance_before = _balance_before_recharge(r_date, daily_readings)
+
+        # For early-detection we need SOME burn rate. The ongoing recharge
+        # (i=0) has no closed window, so fall back to a 7-day rolling mean
+        # ending on the recharge day. Same fallback covers short-interval
+        # recharges (< 3 consumption days) further back in history.
+        classification_rate = avg_spend
+        if classification_rate is None:
+            rolling_start = r_date - timedelta(days=7)
+            rolling_end = r_date - timedelta(days=1)
+            if rolling_start <= rolling_end:
+                _, rolling_days = _build_daily_spends(daily_readings or [], rolling_start, rolling_end)
+                if len(rolling_days) >= 3:
+                    classification_rate = sum(float(d["spend"]) for d in rolling_days) / len(rolling_days)
+
+        is_early = False
+        is_negative = False
+        if balance_before is not None:
+            if balance_before < -1:
+                is_negative = True
+            elif classification_rate is not None and balance_before > 3 * classification_rate:
+                is_early = True
+
+        results.append({
+            "recharge": r,
+            "date": r_date,
+            "amount": amount,
+            "interval_days": interval_days,
+            "avg_daily_spend": avg_spend,
+            "effective_runtime": effective_runtime,
+            "balance_before": balance_before,
+            "is_early": is_early,
+            "is_negative": is_negative,
+            "is_ongoing": is_ongoing,
+        })
+
+    return results
+
+
+def _build_recharge_intervals_image(effectiveness):
+    """Recharge Effectiveness chart.
+
+    Bar length = effective runtime (``amount / avg_daily_spend`` during that
+    recharge's window) — the honest "how long did each recharge last" answer
+    that doesn't get distorted by early top-ups. Falls back to the raw
+    interval with a ▵ marker when < 3 consumption days are available for
+    burn-rate estimation.
+
+    Per-bar color encodes the early-recharge signal:
+      - teal   — normal: recharged close to empty
+      - yellow — early top-up: balance > ~3 days of avg spend remained
+      - red    — ran into grace: balance went negative before top-up
+
+    Each bar annotation shows ``{runtime}d · ₹{balance_before} left`` so the
+    user sees at a glance why a bar is yellow (how much was unused).
+
+    The newest (ongoing) recharge is skipped — no closed window to measure
+    yet.
+
+    Name kept as ``_build_recharge_intervals_image`` for backward compatibility
+    with existing callers; the chart title and semantics are now the richer
+    effectiveness view.
+    """
+    if not effectiveness:
         return None
 
-    labels = []
-    values = []
-    # Row 0 is newest (ongoing), show intervals[0..N-2] for rows 1..N-1
-    for i in range(1, len(all_recharges)):
-        if (i - 1) >= len(intervals):
-            break
-        r = all_recharges[i]
-        r_date = r["date"] if isinstance(r["date"], date) else datetime.strptime(r["date"], "%Y-%m-%d").date()
-        amt = float(r["amount"])
+    # Skip the ongoing newest recharge — no closed window to measure yet.
+    closed = [e for e in effectiveness if not e["is_ongoing"]]
+    if not closed:
+        return None
+
+    labels, values, bar_colors, annotations = [], [], [], []
+    for e in closed:
+        r_date = e["date"]
+        amt = e["amount"]
         amt_label = f"₹{amt/1000:.0f}K" if amt >= 1000 else f"₹{amt:.0f}"
         labels.append(f"{amt_label} {r_date.strftime('%d %b')}")
-        values.append(intervals[i - 1])
 
-    if not values:
-        return None
+        if e["effective_runtime"] is not None:
+            runtime = e["effective_runtime"]
+            marker = ""
+        else:
+            # Fallback: use raw interval when burn rate isn't computable.
+            runtime = e["interval_days"]
+            marker = "▵ "
+        values.append(runtime)
 
-    avg_interval = sum(values) / len(values)
+        if e["is_negative"]:
+            bar_colors.append("#e74c3c")  # red
+        elif e["is_early"]:
+            bar_colors.append("#f1c40f")  # yellow
+        else:
+            bar_colors.append("#4ecca3")  # teal
+
+        bal = e["balance_before"]
+        if bal is None:
+            bal_str = "bal ?"
+        elif bal < -1:
+            bal_str = f"₹{bal:,.0f} (grace)"
+        elif bal > 1:
+            bal_str = f"₹{bal:,.0f} left"
+        else:
+            bal_str = "empty"
+        annotations.append(f"{marker}{runtime:.0f}d · {bal_str}")
+
+    runtimes = [e["effective_runtime"] for e in closed if e["effective_runtime"] is not None]
+    if runtimes:
+        avg_runtime = sum(runtimes) / len(runtimes)
+        coverage_note = f" ({len(runtimes)}/{len(closed)} with burn rate)" if len(runtimes) < len(closed) else ""
+        subtitle = f"Effective runtime per recharge · Avg {avg_runtime:.0f}d{coverage_note}"
+    else:
+        subtitle = "Days between recharges (burn rate unavailable)"
+
     return render_bar_chart(
-        "Recharge Intervals",
-        f"How long each recharge lasted · Avg {avg_interval:.0f} days",
-        labels, values, value_fmt="{:.0f}d", color="#4ecca3",
+        "Recharge Effectiveness",
+        subtitle,
+        labels, values,
+        colors=bar_colors,
+        bar_annotations=annotations,
+        x_axis_fmt=lambda x: f"{int(x)}d",
     )
 
 
@@ -1179,13 +1416,14 @@ def check_fix_charge_anomaly(prev_day_deductions, rate_card):
 
 
 def send_telegram_photo(photo_buf, caption=""):
-    """Send a photo via Telegram Bot API."""
+    """Send a photo via Telegram Bot API. Returns True on success, False on
+    config-missing / network / HTTP errors. Exceptions are always swallowed."""
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
     if not bot_token or not chat_id:
         logger.warning("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set, skipping photo")
-        return
+        return False
 
     url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
     data = {"chat_id": chat_id}
@@ -1198,24 +1436,27 @@ def send_telegram_photo(photo_buf, caption=""):
         resp = requests.post(url, data=data, files=files, timeout=15)
         if resp.ok:
             logger.info("Telegram photo sent")
-        else:
-            # Only log status code — resp.text might echo the URL (with the
-            # embedded bot token) back; this would leak into public GHA logs.
-            logger.warning(f"Telegram photo error: HTTP {resp.status_code}")
+            return True
+        # Only log status code — resp.text might echo the URL (with the
+        # embedded bot token) back; this would leak into public GHA logs.
+        logger.warning(f"Telegram photo error: HTTP {resp.status_code}")
+        return False
     except Exception as e:
         # Exception messages from `requests` often contain the full URL
         # including the bot token. Log only the exception type.
         logger.warning(f"Failed to send Telegram photo: {type(e).__name__}")
+        return False
 
 
 def send_telegram_message(text):
-    """Send a message via Telegram Bot API"""
+    """Send a message via Telegram Bot API. Returns True on success, False on
+    config-missing / network / HTTP errors. Exceptions are always swallowed."""
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
     if not bot_token or not chat_id:
         logger.warning("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set, skipping notification")
-        return
+        return False
 
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
@@ -1224,12 +1465,14 @@ def send_telegram_message(text):
         resp = requests.post(url, json=payload, timeout=10)
         if resp.ok:
             logger.info("Telegram notification sent")
-        else:
-            # resp.text may echo the URL (with bot token) — log only status.
-            logger.warning(f"Telegram API error: HTTP {resp.status_code}")
+            return True
+        # resp.text may echo the URL (with bot token) — log only status.
+        logger.warning(f"Telegram API error: HTTP {resp.status_code}")
+        return False
     except Exception as e:
         # Exception message may contain the URL with bot token.
         logger.warning(f"Failed to send Telegram message: {type(e).__name__}")
+        return False
 
 
 def _budget_line(current_month, rate_card=None):
@@ -1579,6 +1822,20 @@ MAX_PLAUSIBLE_POWER_KW = 50.0
 STALE_SYNC_WARN_MINUTES = 20          # Log a WARN if portal's last_sync is older than this
 RECHARGE_JUMP_THRESHOLD = 500         # Balance jump in a single 20-min window ≥ this triggers save_recharge
 
+# Sync-stall alert: the meter occasionally loses comms with the vendor portal
+# and `last_sync` freezes for hours (20h stall observed on 2026-04-16). While
+# frozen, snapshot runs would otherwise store duplicate rows with stuck values
+# and mislead the alert engine. We detect stall by comparing the current
+# `last_sync` to the previous reading's; fields get NULLed in storage and an
+# escalating Telegram alert fires on exponential backoff.
+SYNC_STALL_ALERT_MINUTES = 60
+SYNC_STALL_BACKOFF_HOURS = [2, 4, 8, 16, 32]  # minimum gap since last fire; last value repeats on saturation
+
+# Smart Recharge Advisor: skip the advisory message if the user topped up
+# within this many days (queried from the `recharges` table). Covers the
+# "just recharged, don't nag" case without depending on in-memory state.
+_ADVISOR_POST_RECHARGE_DAYS = 2
+
 
 def parse_last_sync(raw):
     """Parse the portal's last_sync string (e.g. '16-04-2026 09:21:27') to
@@ -1595,6 +1852,159 @@ def parse_last_sync(raw):
         return dt.replace(tzinfo=IST)
     except (ValueError, TypeError):
         return None
+
+
+def _humanize_duration(td):
+    """Render a timedelta as '1d 4h', '3h 12m', or '45m'. Used in stall
+    alert messages; precision beyond minutes isn't useful for a 60min+
+    alert threshold."""
+    total = int(td.total_seconds())
+    if total < 0:
+        total = 0
+    days = total // 86400
+    hours = (total % 86400) // 3600
+    mins = (total % 3600) // 60
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if mins and not days:
+        parts.append(f"{mins}m")
+    return " ".join(parts) if parts else "0m"
+
+
+def _detect_sync_stall(last_sync_dt, prev_reading):
+    """Return True when the portal's meter sync time hasn't advanced since
+    the previous snapshot. Treats the current reading as stuck repeat data.
+
+    Returns False when we can't determine (no parseable last_sync, no prev
+    reading, or prev.last_sync is NULL) — callers then save the row as-is.
+    """
+    if last_sync_dt is None or prev_reading is None:
+        return False
+    prev_sync = prev_reading.get("last_sync")
+    if prev_sync is None:
+        return False
+    return last_sync_dt == prev_sync
+
+
+def _check_sync_stall_alerts(last_sync_dt, now, prev_reading, balance):
+    """Fire exponential-backoff stall alerts and resume notifications.
+
+    Stall (last_sync unchanged from prev AND staleness ≥ threshold):
+      - First detection: fire, set alert_state with fire_count=1, stuck_since,
+        balance_at_stall.
+      - Re-fire only after SYNC_STALL_BACKOFF_HOURS[fire_count-1] has elapsed
+        since last_fired_at. Ladder caps at the last entry (32h by default).
+
+    Resume (previously stuck state exists AND sync has advanced):
+      - Send resume Telegram with duration + balance delta.
+      - Clear alert_state so the next stall fires a fresh first-alert.
+
+    No-op when last_sync is unparseable or when we have no prev reading.
+    """
+    is_stalled = _detect_sync_stall(last_sync_dt, prev_reading)
+    state = get_alert_state("sync_stuck")
+
+    if state and not is_stalled:
+        # First-run / cold-start guard: if we have no prior reading to compare
+        # against, we can't actually confirm the sync advanced. Orphaned
+        # sync_stuck state from a prior deployment (or manual test) would
+        # otherwise fire a spurious resume with garbage context. Silently
+        # clear and return — the next snapshot with a proper prev_reading
+        # will correctly classify.
+        if prev_reading is None or last_sync_dt is None:
+            clear_alert_state("sync_stuck")
+            logger.info("sync_stuck state cleared without alert (no prev reading to confirm resume)")
+            return
+
+        ctx = state.get("context") or {}
+        stuck_since_iso = ctx.get("stuck_since")
+        balance_at_stall = ctx.get("balance_at_stall")
+
+        stuck_since_dt = None
+        if stuck_since_iso:
+            try:
+                stuck_since_dt = datetime.fromisoformat(stuck_since_iso)
+            except ValueError:
+                stuck_since_dt = None
+
+        duration_str = _humanize_duration(now - stuck_since_dt) if stuck_since_dt else "unknown"
+        stuck_since_str = stuck_since_dt.strftime("%d %b %H:%M") if stuck_since_dt else "unknown"
+
+        delta_line = ""
+        if balance_at_stall is not None and balance is not None:
+            try:
+                prev_bal = Decimal(str(balance_at_stall))
+                curr_bal = Decimal(str(balance))
+                delta = curr_bal - prev_bal
+                sign = "+" if delta >= 0 else ""
+                delta_line = (
+                    f"Balance: ₹{prev_bal:.2f} → ₹{curr_bal:.2f} "
+                    f"(Δ {sign}₹{delta:.2f})\n"
+                )
+            except (InvalidOperation, ValueError):
+                delta_line = ""
+
+        msg = (
+            "✅ <b>Meter sync resumed</b>\n\n"
+            f"Stuck since: {stuck_since_str} IST\n"
+            f"Blind window: {duration_str}\n"
+            f"{delta_line}"
+        )
+        # Only clear alert_state when the resume notification actually made it
+        # to Telegram. If send fails (network, 429, outage), leave state intact
+        # so the next snapshot retries the resume. The backoff ladder keeps
+        # the retry cost bounded.
+        if send_telegram_message(msg):
+            clear_alert_state("sync_stuck")
+            logger.info(f"sync_stuck resumed after {duration_str}")
+        else:
+            logger.warning("sync_stuck resume Telegram failed; leaving state for retry")
+        return
+
+    if not is_stalled or last_sync_dt is None:
+        return
+
+    staleness = now - last_sync_dt
+    if staleness < timedelta(minutes=SYNC_STALL_ALERT_MINUTES):
+        return
+
+    ctx = (state.get("context") if state else None) or {}
+    fire_count = int(ctx.get("fire_count", 0))
+
+    if state:
+        idx = min(max(fire_count - 1, 0), len(SYNC_STALL_BACKOFF_HOURS) - 1)
+        required_gap = timedelta(hours=SYNC_STALL_BACKOFF_HOURS[idx])
+        if (now - state["last_fired_at"]) < required_gap:
+            return
+
+    new_fire_count = fire_count + 1
+    next_idx = min(new_fire_count - 1, len(SYNC_STALL_BACKOFF_HOURS) - 1)
+    next_gap_h = SYNC_STALL_BACKOFF_HOURS[next_idx]
+
+    stuck_since_iso = ctx.get("stuck_since") or last_sync_dt.isoformat()
+    balance_at_stall = ctx.get("balance_at_stall")
+    if balance_at_stall is None and prev_reading is not None:
+        prev_bal = prev_reading.get("balance")
+        if prev_bal is not None:
+            balance_at_stall = str(prev_bal)
+
+    msg = (
+        "⚠️ <b>Meter sync frozen</b>\n\n"
+        f"Last update: {last_sync_dt.strftime('%d %b %H:%M')} IST\n"
+        f"Stale for: {_humanize_duration(staleness)}\n"
+        f"Notification #{new_fire_count} · next check in {next_gap_h}h"
+    )
+    send_telegram_message(msg)
+
+    set_alert_state("sync_stuck", now, {
+        "fire_count": new_fire_count,
+        "stuck_since": stuck_since_iso,
+        "balance_at_stall": balance_at_stall,
+    })
+    logger.warning(f"sync_stuck alert #{new_fire_count} fired (stale {_humanize_duration(staleness)})")
 
 
 def _run_alert_engine(current_reading, now):
@@ -1752,7 +2162,7 @@ def check_night_anomaly_alert(current, now):
     set_alert_state("night_anomaly", now, {"power_kw": float(power)})
 
 
-def _snapshot_recharge_detect(prev_reading, current_balance, now):
+def _snapshot_recharge_detect(prev_reading, current_balance, now, max_age=timedelta(hours=6)):
     """Detect a mid-day recharge by comparing this snapshot's balance to
     the previous reading's balance. If the jump is ≥ RECHARGE_JUMP_THRESHOLD,
     call save_recharge() (which handles its own dedup against portal data).
@@ -1761,11 +2171,22 @@ def _snapshot_recharge_detect(prev_reading, current_balance, now):
     balance-jump recharges from daily_readings, but at 20-min granularity
     we can catch them near-real-time and surface the balance change in any
     alert context that might need it.
+
+    ``max_age`` bounds how old ``prev_reading`` can be before we skip
+    detection. The caller loads a 24h lookback for stall detection and
+    shares that reading here; we re-apply a tighter 6h bound so a
+    post-outage first run doesn't misattribute a multi-day gap to an
+    instantaneous recharge. Portal-side authoritative recharges will still
+    be merged via ``_process_portal_recharges``.
     """
     if prev_reading is None or current_balance is None:
         return
     prev_balance = prev_reading.get("balance")
     if prev_balance is None:
+        return
+
+    prev_ts = prev_reading.get("recorded_at")
+    if prev_ts is not None and (now - prev_ts) > max_age:
         return
 
     jump = float(current_balance) - float(prev_balance)
@@ -1776,6 +2197,64 @@ def _snapshot_recharge_detect(prev_reading, current_balance, now):
     # (±2 days). It's safe to call even if this recharge was already
     # detected from daily-level data.
     save_recharge(now.date(), jump, float(prev_balance), float(current_balance))
+
+
+def _process_portal_recharges(portal_recharges, balance, daily_readings, now=None):
+    """Detect new portal recharges vs stored snapshot, send the analysis
+    Telegram (with recharge-table and effectiveness images), then merge +
+    dedup into the unified ``recharges`` table and refresh the portal
+    snapshot.
+
+    Runs at snapshot cadence so a recharge appears in Telegram within one
+    20-min window of the vendor publishing it. No mode gating — the first
+    run after vendor-publish wins the atomic claim and notifies;
+    subsequent runs see ``stored == current`` and no-op.
+
+    Concurrency: Two overlapping GHA runs can both observe the same
+    ``stored`` and ``detect_new_recharges`` result. Atomic de-duplication
+    is handled by ``claim_portal_recharge_notification`` which races a
+    ``RETURNING id`` INSERT on the ``recharges`` UNIQUE (date, amount)
+    constraint — only the winner sends the notification.
+    """
+    if not portal_recharges:
+        return
+
+    stored = load_portal_recharges()
+    new_recharges = detect_new_recharges(portal_recharges, stored)
+
+    if new_recharges:
+        newest = new_recharges[0]
+        if claim_portal_recharge_notification(newest):
+            effectiveness = _compute_recharge_effectiveness(portal_recharges, daily_readings, now=now)
+
+            analysis_msg = build_recharge_analysis(
+                new_recharges, portal_recharges, balance, daily_readings,
+                effectiveness=effectiveness, now=now,
+            )
+            send_telegram_message(analysis_msg)
+
+            table_intervals = []
+            for i in range(len(portal_recharges) - 1):
+                d1 = portal_recharges[i]["date"] if isinstance(portal_recharges[i]["date"], date) else datetime.strptime(portal_recharges[i]["date"], "%Y-%m-%d").date()
+                d2 = portal_recharges[i + 1]["date"] if isinstance(portal_recharges[i + 1]["date"], date) else datetime.strptime(portal_recharges[i + 1]["date"], "%Y-%m-%d").date()
+                table_intervals.append((d1 - d2).days)
+
+            recharge_img = _build_recharge_table_image(portal_recharges, table_intervals)
+            if recharge_img:
+                send_telegram_photo(recharge_img)
+            effectiveness_img = _build_recharge_intervals_image(effectiveness)
+            if effectiveness_img:
+                send_telegram_photo(effectiveness_img)
+        else:
+            # Another concurrent runner already claimed the notification —
+            # still refresh local state so we stay in sync, then exit.
+            logger.info(
+                f"portal recharge on {newest.get('date')} already claimed by another run; skipping notification"
+            )
+
+    merge_portal_recharges_to_history(portal_recharges)
+    cleanup_duplicate_recharges()
+    save_portal_recharges(portal_recharges)
 
 
 def _build_load_profile_image(today_readings_ist):
@@ -1890,30 +2369,63 @@ def main():
         # ------------------------------------------------------------------
         now_ist = datetime.now(IST)
         last_sync_dt = parse_last_sync(last_sync)
-        save_reading(now_ist, last_sync_dt, last_sync, electrical_params, balance)
 
-        # Staleness log (not an alert — just a debug breadcrumb).
+        # Detect sync stall BEFORE save by comparing the portal's meter-sync
+        # time to the most recent prior reading's. When the meter loses comms
+        # with the vendor, `last_sync` freezes for hours (20h observed once)
+        # and the portal keeps returning the same stale snapshot. Persisting
+        # those as valid rows latches the sustained-load alert, pollutes the
+        # 24h power-profile chart, and misattributes balance jumps. The fix:
+        # write a heartbeat row but NULL the derived fields when stuck.
+        prev_reading = load_previous_reading(now_ist, max_age=timedelta(hours=24))
+        is_sync_stalled = _detect_sync_stall(last_sync_dt, prev_reading)
+
+        if is_sync_stalled:
+            # Heartbeat row only: recorded_at + last_sync preserved for audit.
+            save_reading(now_ist, last_sync_dt, last_sync, None, None)
+        else:
+            save_reading(now_ist, last_sync_dt, last_sync, electrical_params, balance)
+
+        # Stall alert (exponential backoff) + resume notification.
+        _check_sync_stall_alerts(last_sync_dt, now_ist, prev_reading, balance)
+
+        # Staleness log — debug breadcrumb for the shorter 20-min window.
+        # Real alerting with cooldown/backoff lives in _check_sync_stall_alerts.
         if last_sync_dt is not None:
             staleness = now_ist - last_sync_dt
             if staleness > timedelta(minutes=STALE_SYNC_WARN_MINUTES):
                 logger.warning(f"Portal last_sync is {staleness} old — meter may be offline")
 
-        # Snapshot mode short-circuit: save the reading, run the alert
-        # engine, maybe record a mid-day recharge, then exit without any
-        # report flow or daily aggregate churn.
-        if mode == "snapshot":
-            # Mid-day recharge detection from balance jump.
-            prev_reading = load_previous_reading(now_ist, max_age=timedelta(hours=6))
-            _snapshot_recharge_detect(prev_reading, balance, now_ist)
+        # Shared in-hand view. During stalls the derived fields are None so
+        # the alert engine and recharge-detect helpers correctly treat the
+        # reading as "data absent" rather than a valid sample at 0.
+        current_power = None if is_sync_stalled else (electrical_params or {}).get("active_power_kw")
+        current_balance = None if is_sync_stalled else balance
 
-            # Edge-triggered alerts. The "current" view matches the shape
-            # that load_readings returns (dict keyed by column names) —
-            # build a minimal one from in-hand values so we don't round-trip
-            # the DB for the reading we just wrote.
+        # Snapshot mode short-circuit: save the reading, run the alert
+        # engine, maybe record a mid-day recharge, process any new portal
+        # recharges, then exit without any report flow or daily aggregate
+        # churn.
+        if mode == "snapshot":
+            # Mid-day recharge detection from balance jump. Skipped during
+            # stalls — the stuck balance would produce a spurious jump on
+            # resume. The portal-recharge path below is authoritative.
+            if not is_sync_stalled:
+                _snapshot_recharge_detect(prev_reading, balance, now_ist)
+
+            # Portal recharge analysis moved from evening to snapshot: once
+            # the vendor publishes a new BindRecharge entry, it surfaces in
+            # Telegram within one 20-min window instead of waiting for 22:00.
+            # Pass the stall-aware `current_balance` (None during stalls) so
+            # the analysis message doesn't quote a stale balance, and a
+            # single caller-captured `now_ist` so mid-computation midnight
+            # rollovers and UTC-vs-IST drift can't bite.
+            _process_portal_recharges(portal_recharges, current_balance, daily_readings, now=now_ist)
+
             current_reading = {
                 "recorded_at": now_ist,
-                "active_power_kw": (electrical_params or {}).get("active_power_kw"),
-                "balance": balance,
+                "active_power_kw": current_power,
+                "balance": current_balance,
             }
             _run_alert_engine(current_reading, now_ist)
 
@@ -1944,11 +2456,12 @@ def main():
 
         # Run the alert engine in report modes too — same data is in hand,
         # running checks here gives us extra coverage at 6:30 / 17:30 / 22:00
-        # in case a snapshot run missed the edge.
+        # in case a snapshot run missed the edge. Stall-aware: derived
+        # fields are None when sync is frozen.
         current_reading = {
             "recorded_at": now_ist,
-            "active_power_kw": (electrical_params or {}).get("active_power_kw"),
-            "balance": balance,
+            "active_power_kw": current_power,
+            "balance": current_balance,
         }
         _run_alert_engine(current_reading, now_ist)
 
@@ -1996,37 +2509,17 @@ def main():
             if fix_msg:
                 send_telegram_message(fix_msg)
 
-        # Recharge analysis (evening: detect new recharges and send analysis)
-        new_recharges = []
-        if portal_recharges:
-            stored = load_portal_recharges()
-            new_recharges = detect_new_recharges(portal_recharges, stored)
+        # Portal recharge analysis is now handled in snapshot mode so new
+        # recharges surface within 20min of the vendor publishing them —
+        # see _process_portal_recharges() called from the snapshot branch.
 
-            if new_recharges and mode == "evening":
-                analysis_msg = build_recharge_analysis(
-                    new_recharges, portal_recharges, balance, daily_readings
-                )
-                send_telegram_message(analysis_msg)
-                # Send recharge table as image
-                intervals = []
-                for i in range(len(portal_recharges) - 1):
-                    d1 = portal_recharges[i]["date"] if isinstance(portal_recharges[i]["date"], date) else datetime.strptime(portal_recharges[i]["date"], "%Y-%m-%d").date()
-                    d2 = portal_recharges[i+1]["date"] if isinstance(portal_recharges[i+1]["date"], date) else datetime.strptime(portal_recharges[i+1]["date"], "%Y-%m-%d").date()
-                    intervals.append((d1 - d2).days)
-                recharge_img = _build_recharge_table_image(portal_recharges, intervals)
-                if recharge_img:
-                    send_telegram_photo(recharge_img)
-                intervals_img = _build_recharge_intervals_image(portal_recharges, intervals)
-                if intervals_img:
-                    send_telegram_photo(intervals_img)
-
-            merge_portal_recharges_to_history(portal_recharges)
-            cleanup_duplicate_recharges()
-            save_portal_recharges(portal_recharges)
-
-        # Smart Recharge Advisor (Feature 1 — evening only, separate message)
+        # Smart Recharge Advisor (evening only). Suppression after a recent
+        # top-up now queries the recharges table directly (see
+        # build_recharge_advisor) — the old in-memory new_recharges handshake
+        # no longer applies once portal recharge processing moved to snapshot
+        # mode.
         if mode == "evening" and balance is not None and balance > 0 and daily_readings:
-            advisor_msg = build_recharge_advisor(balance, daily_readings, new_recharges)
+            advisor_msg = build_recharge_advisor(balance, daily_readings, now=now_ist)
             if advisor_msg:
                 send_telegram_message(advisor_msg)
 

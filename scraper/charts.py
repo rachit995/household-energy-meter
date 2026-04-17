@@ -103,7 +103,8 @@ def render_table_image(title, subtitle, headers, rows, col_alignments=None, high
     return _fig_to_bytes(fig)
 
 
-def render_bar_chart(title, subtitle, labels, values, value_fmt="₹{:.0f}", color=GREEN_COLOR):
+def render_bar_chart(title, subtitle, labels, values, value_fmt="₹{:.0f}", color=GREEN_COLOR,
+                     colors=None, bar_annotations=None, x_axis_fmt=None):
     """Render a horizontal bar chart as PNG image.
 
     Args:
@@ -111,30 +112,48 @@ def render_bar_chart(title, subtitle, labels, values, value_fmt="₹{:.0f}", col
         subtitle: Description
         labels: List of bar labels
         values: List of numeric values
-        value_fmt: Format string for value labels
-        color: Bar color
+        value_fmt: Format string for value labels (ignored when bar_annotations set)
+        color: Default bar color (used when ``colors`` is None)
+        colors: Optional per-bar color list. When provided, overrides ``color``
+                and disables the default max/min highlight (caller encodes
+                meaning via the color list itself).
+        bar_annotations: Optional per-bar annotation strings. Replaces the
+                         ``value_fmt.format(val)`` label next to each bar.
+        x_axis_fmt: Optional ``lambda x: str`` for x-axis tick formatting.
+                    Defaults to ``₹{x:.0f}``.
     Returns:
         BytesIO PNG image buffer
     """
     n = len(labels)
+    if n == 0 or not values:
+        return None
+    if colors is not None and len(colors) != n:
+        raise ValueError(f"colors length {len(colors)} != labels length {n}")
+    if bar_annotations is not None and len(bar_annotations) != n:
+        raise ValueError(f"bar_annotations length {len(bar_annotations)} != labels length {n}")
+
     fig, ax = plt.subplots(figsize=(6, max(1.5 + 0.4 * n, 3)))
     fig.set_facecolor(BG_COLOR)
     ax.set_facecolor(BG_COLOR)
 
     float_vals = [float(v) for v in values]
     y_pos = range(n - 1, -1, -1)
-    bars = ax.barh(y_pos, float_vals, color=color, height=0.6, edgecolor="none", alpha=0.85)
 
-    # Highlight max/min
-    max_idx = float_vals.index(max(float_vals))
-    min_idx = float_vals.index(min(float_vals))
-    bars[max_idx].set_color(ACCENT_COLOR)
-    bars[min_idx].set_color("#3498db")
+    if colors is not None:
+        bars = ax.barh(y_pos, float_vals, color=colors, height=0.6, edgecolor="none", alpha=0.85)
+    else:
+        bars = ax.barh(y_pos, float_vals, color=color, height=0.6, edgecolor="none", alpha=0.85)
+        # Highlight max/min only when the caller didn't supply per-bar colors.
+        max_idx = float_vals.index(max(float_vals))
+        min_idx = float_vals.index(min(float_vals))
+        bars[max_idx].set_color(ACCENT_COLOR)
+        bars[min_idx].set_color("#3498db")
 
     ax.set_yticks(y_pos)
     ax.set_yticklabels(labels, fontsize=10, color=TEXT_COLOR, fontfamily="monospace")
     ax.tick_params(axis="x", colors=TEXT_COLOR, labelsize=8)
-    ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, p: f"₹{x:.0f}"))
+    tick_fmt = x_axis_fmt if x_axis_fmt is not None else (lambda x: f"₹{x:.0f}")
+    ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, p: tick_fmt(x)))
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax.spines["bottom"].set_color(GRID_COLOR)
@@ -143,7 +162,7 @@ def render_bar_chart(title, subtitle, labels, values, value_fmt="₹{:.0f}", col
 
     # Value labels on bars
     for i, (bar, val) in enumerate(zip(bars, float_vals)):
-        label = value_fmt.format(val)
+        label = bar_annotations[i] if bar_annotations is not None else value_fmt.format(val)
         ax.text(bar.get_width() + max(float_vals) * 0.02, bar.get_y() + bar.get_height() / 2,
                 label, va="center", ha="left", fontsize=9, color=TEXT_COLOR, fontfamily="monospace")
 
