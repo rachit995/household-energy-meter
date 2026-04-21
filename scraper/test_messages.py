@@ -27,6 +27,7 @@ from scraper import (
     _build_balance_runway_image, _build_bill_split_image,
     _build_week_vs_week_image, _build_balance_journey_image,
     _build_monthly_trend_image, _build_recharge_intervals_image,
+    _compute_recharge_effectiveness,
     SEASON_HINTS,
 )
 from storage import load_portal_recharges, detect_new_recharges
@@ -135,20 +136,22 @@ def main():
     print("\n--- Recharge Analysis ---")
     if portal_recharges:
         fake_new = [{"date": portal_recharges[0]["date"], "amount": float(portal_recharges[0]["amount"]), "type": portal_recharges[0].get("type", "")}]
+        effectiveness = _compute_recharge_effectiveness(portal_recharges, daily_readings)
         send("Recharge Analysis", build_recharge_analysis(
-            fake_new, portal_recharges, balance, daily_readings
+            fake_new, portal_recharges, balance, daily_readings,
+            effectiveness=effectiveness,
         ))
-        intervals = []
+        table_intervals = []
         for i in range(len(portal_recharges) - 1):
             d1 = portal_recharges[i]["date"] if isinstance(portal_recharges[i]["date"], date) else datetime.strptime(portal_recharges[i]["date"], "%Y-%m-%d").date()
             d2 = portal_recharges[i+1]["date"] if isinstance(portal_recharges[i+1]["date"], date) else datetime.strptime(portal_recharges[i+1]["date"], "%Y-%m-%d").date()
-            intervals.append((d1 - d2).days)
-        send_img("Recharge Table", _build_recharge_table_image(portal_recharges, intervals))
-        send_img("Recharge Intervals", _build_recharge_intervals_image(portal_recharges, intervals))
+            table_intervals.append((d1 - d2).days)
+        send_img("Recharge Table", _build_recharge_table_image(portal_recharges, table_intervals))
+        send_img("Recharge Effectiveness", _build_recharge_intervals_image(effectiveness))
 
     # === ALERTS ===
     print("\n--- Alerts ---")
-    send("Recharge Advisor", build_recharge_advisor(Decimal("1200"), daily_readings, []))
+    send("Recharge Advisor", build_recharge_advisor(Decimal("1200"), daily_readings))
 
     # Spending Trend (force — bypass day check)
     from storage import load_daily_readings as ldr

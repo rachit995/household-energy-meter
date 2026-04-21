@@ -9,7 +9,9 @@ matplotlib.use("Agg")  # Non-interactive backend
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import matplotlib.dates as mdates
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
+
+IST = timezone(timedelta(hours=5, minutes=30))
 
 
 # Dark theme colors
@@ -467,8 +469,8 @@ def render_time_profile_chart(title, subtitle, timestamps, values,
     # X-axis: hours across the day. AutoDateLocator picks sensible tick
     # spacing based on the total span (every 2-3 hours for a 24h chart).
     # DateFormatter produces "HH:MM" labels.
-    ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=5, maxticks=12))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=5, maxticks=12, tz=IST))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=IST))
 
     # Y-axis: kW formatting with one decimal place.
     ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda y, _: f"{y:.1f} kW"))
