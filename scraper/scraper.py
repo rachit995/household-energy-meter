@@ -29,6 +29,14 @@ from charts import (render_table_image, render_bar_chart, render_spend_chart,
                      render_time_profile_chart)
 from api_client import SmartGridClient
 from normalizer import normalize
+from appliances import (
+    HIGH_POWER_KW_THRESHOLD,
+    SUSTAINED_LOAD_KW,
+    NIGHT_ANOMALY_KW,
+    BASELINE_KW,
+    MAJOR_LOAD_FLOOR_KW,
+    ALL_APPLIANCES,
+)
 
 load_dotenv()
 from datetime import date, datetime, timezone, timedelta
@@ -1603,7 +1611,132 @@ def build_morning_message(balance, current_month, prev_day, prev_month, monthly_
     return msg
 
 
-def build_evening_message(balance, current_month, today, duration, last_sync=None, daily_readings=None, rate_card=None):
+def _attribute_daily_cost(readings_20min, rate_card):
+    """Split today's cost into coarse buckets by integrating power over
+    20-min intervals and pricing each interval using its own source.
+
+    At 20-min granularity, cost attribution cannot identify specific
+    appliances reliably. This function deliberately uses only three
+    buckets to stay honest:
+
+      - baseline: power in [0, MAJOR_LOAD_FLOOR_KW] — fridge + small loads
+      - major:    power >= MAJOR_LOAD_FLOOR_KW — ACs / geysers, not
+                  separated (a ~2 kW delta could be either at this
+                  granularity).
+      - other:    gaps (interval > 30 min or either endpoint NULL).
+
+    Pricing:
+      - Use apparent_power_kva when available (tariff is ₹/kVAh).
+      - Fall back to active_power_kw when apparent is NULL (approximates
+        power_factor 1.0, under-estimating cost by ~5%).
+      - Select per-interval rate from `source`: "Generator" → dg_rate
+        (when set), else eb_rate. Gaps go into 'other' priced similarly.
+
+    Returns:
+        {
+          "baseline": float (INR),
+          "major":    float,
+          "other":    float,
+          "total_attributed": float,
+          "confidence": "medium" | "low",   # "low" if other/total > 0.25
+        }
+
+    Returns all zeros (confidence="medium") if `readings_20min` is empty,
+    `rate_card` is None/empty, or neither eb_rate nor dg_rate is set.
+    """
+    zeros = {
+        "baseline": 0.0,
+        "major": 0.0,
+        "other": 0.0,
+        "total_attributed": 0.0,
+        "confidence": "medium",
+    }
+    if not readings_20min or not rate_card:
+        return zeros
+
+    eb = rate_card.get("eb_rate")
+    dg = rate_card.get("dg_rate")
+    if not eb and not dg:
+        return zeros
+    eb = float(eb) if eb else None
+    dg = float(dg) if dg else None
+
+    rows = sorted(readings_20min, key=lambda r: r["recorded_at"])
+
+    baseline = 0.0
+    major = 0.0
+    other = 0.0
+
+    for i in range(len(rows) - 1):
+        a = rows[i]
+        b = rows[i + 1]
+        dt_h = (b["recorded_at"] - a["recorded_at"]).total_seconds() / 3600.0
+
+        # Rate selection per interval — use start-of-interval source.
+        src = a.get("source")
+        if src == "Generator" and dg:
+            rate = dg
+        elif eb:
+            rate = eb
+        else:
+            rate = dg  # only dg set, no eb — price everything at dg
+
+        # Apparent power matches the ₹/kVAh tariff; active is a fallback
+        # when apparent wasn't reported (approximates PF=1.0).
+        a_pow = a.get("apparent_power_kva")
+        if a_pow is None:
+            a_pow = a.get("active_power_kw")
+        b_pow = b.get("apparent_power_kva")
+        if b_pow is None:
+            b_pow = b.get("active_power_kw")
+
+        # Gap / NULL → attribute entire interval to "other" at the
+        # interval's source-aware rate.
+        if dt_h > 0.5 or a_pow is None or b_pow is None:
+            # Use a nominal 0.3 kVA load (baseline-ish) when either
+            # endpoint's power is unknown; for pure time-gap intervals
+            # where both endpoints have power, use endpoint-a's value.
+            if a_pow is None and b_pow is None:
+                nom = 0.3
+            elif a_pow is None:
+                nom = float(b_pow)
+            else:
+                nom = float(a_pow)
+            other += nom * dt_h * rate
+            continue
+
+        kvah = float(a_pow) * dt_h
+        cost = kvah * rate
+
+        # Load-type bucket uses active_power_kw (the threshold is about
+        # load type, not billing). Fall back to apparent if active is
+        # missing.
+        load_kw = a.get("active_power_kw")
+        if load_kw is None:
+            load_kw = a.get("apparent_power_kva") or 0.0
+        if float(load_kw) < MAJOR_LOAD_FLOOR_KW:
+            baseline += cost
+        else:
+            major += cost
+
+    total = baseline + major + other
+    if total == 0:
+        confidence = "medium"
+    elif other / total > 0.25:
+        confidence = "low"
+    else:
+        confidence = "medium"
+
+    return {
+        "baseline": baseline,
+        "major": major,
+        "other": other,
+        "total_attributed": total,
+        "confidence": confidence,
+    }
+
+
+def build_evening_message(balance, current_month, today, duration, last_sync=None, daily_readings=None, rate_card=None, readings_20min=None):
     """Build the evening Telegram message with today's spending and balance runway"""
     td = today
     rc = rate_card or {}
@@ -1640,6 +1773,20 @@ def build_evening_message(balance, current_month, today, duration, last_sync=Non
         f"  Fix Charge: ₹{fix_display or '—'}\n"
     )
 
+    # Cost breakdown — coarse buckets; gracefully no-op if no readings or rates.
+    if readings_20min and rc:
+        attrib = _attribute_daily_cost(readings_20min, rc)
+        if attrib["total_attributed"] > 0:
+            msg += (
+                "\n<b>Cost Breakdown (approx)</b>\n"
+                f"  🏠 Baseline: ₹{attrib['baseline']:.0f}\n"
+                f"  🌡️ Major loads: ₹{attrib['major']:.0f}  "
+                f"<i>(ACs + geysers)</i>\n"
+                f"  ❓ Other / gaps: ₹{attrib['other']:.0f}\n"
+            )
+            if attrib["confidence"] == "low":
+                msg += "  <i>(low confidence — significant snapshot gaps today)</i>\n"
+
     # Balance runway using last 7 days of actual daily spends
     if balance and balance > 0 and daily_readings:
         today_date = date.today()
@@ -1675,21 +1822,27 @@ def _source_display(source_text):
 
 
 def _appliance_hint(active_power_kw):
-    """Return a short appliance hint based on current power draw."""
+    """Describe likely appliance load for current power reading.
+
+    Uses the known appliance inventory (see scraper/appliances.py).
+    Returns a short parenthetical suffix for report strings. Language
+    stays generic because at 20-min granularity we cannot reliably
+    distinguish one major load from another.
+    """
     if active_power_kw is None:
         return ""
-    kw = float(active_power_kw)
-    if kw >= 3.0:
-        return " (AC + geyser likely on)"
-    elif kw >= 2.0:
-        return " (AC or geyser may be on)"
-    elif kw >= 1.0:
-        return " (AC or heavy appliance)"
-    elif kw >= 0.3:
-        return " (normal — fridge, lights)"
-    elif kw > 0:
-        return " (standby load)"
-    return ""
+    kw = float(active_power_kw) - BASELINE_KW
+    if kw < 0.2:
+        return " (baseline — fridge, lights, router)"
+    if kw >= 3.8:
+        return " (two ACs + geyser, or 3+ major loads)"
+    if kw >= 3.4:
+        return " (two major loads running)"
+    if kw >= 1.8:
+        return " (one AC or geyser heating)"
+    if kw >= 1.4:
+        return " (likely one AC)"
+    return " (small appliance)"
 
 
 def _project_daily_spend(today_deductions, rate_card):
@@ -1800,18 +1953,15 @@ def build_afternoon_message(balance, current_month, today, duration, last_sync=N
 # Tunables for the alert engine. Centralized here so they're easy to adjust
 # once we have a few weeks of real data and can calibrate thresholds.
 
-HIGH_POWER_KW_THRESHOLD = 2.5       # Single-reading spike trigger (kW)
 HIGH_POWER_COOLDOWN_HOURS = 1       # Don't re-fire high_power within this window
 
-SUSTAINED_LOAD_KW = 2.5              # Sustained-load trigger (kW)
-SUSTAINED_LOAD_MIN_SAMPLES = 10      # of 12 expected samples in 2h window
+SUSTAINED_LOAD_MIN_SAMPLES = 5       # of 6 expected samples in 2h window (20-min cadence; 10-of-12 was the 10-min-cadence era)
 SUSTAINED_LOAD_COOLDOWN_HOURS = 4    # Longer cooldown — AC can run hours
 # Require the earliest valid sample in the window to cover at least this
 # much of the 2h span. Without this, 10 samples clustered in the last 100
 # min would trigger "sustained 2+ hours" on false premises.
 SUSTAINED_LOAD_MIN_SPAN_MINUTES = 105
 
-NIGHT_ANOMALY_KW = 1.0                # Threshold between 00:00-05:00 IST
 NIGHT_ANOMALY_COOLDOWN_HOURS = 2
 
 # Sanity cap — the scraped portal can glitch and return implausibly high
@@ -2465,8 +2615,16 @@ def main():
         }
         _run_alert_engine(current_reading, now_ist)
 
+        # Phase 2 evening cost attribution needs today's 20-min readings
+        # BEFORE build_evening_message is called. Same list is reused for
+        # the 24-hour load-profile chart below — no double-query.
+        today_readings = None
         if mode == "evening":
-            msg = build_evening_message(balance, current_month, today, duration, last_sync, daily_readings=daily_readings, rate_card=rate_card)
+            today_start_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+            today_readings = load_readings(today_start_ist, now_ist + timedelta(seconds=1))
+
+        if mode == "evening":
+            msg = build_evening_message(balance, current_month, today, duration, last_sync, daily_readings=daily_readings, rate_card=rate_card, readings_20min=today_readings)
         elif mode == "afternoon":
             msg = build_afternoon_message(balance, current_month, today, duration, last_sync, daily_readings=daily_readings, rate_card=rate_card, electrical_params=electrical_params)
         else:
@@ -2482,10 +2640,8 @@ def main():
 
             # Phase 2: 24-hour power profile chart, built from the
             # high-frequency `readings` table populated by snapshot runs.
-            # Query today's data in IST — we want a calendar-day window,
-            # not the last 24 rolling hours.
-            today_start_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
-            today_readings = load_readings(today_start_ist, now_ist + timedelta(seconds=1))
+            # `today_readings` was loaded above (before build_evening_message)
+            # so the Cost Breakdown block and this chart share one query.
             profile_img = _build_load_profile_image(today_readings)
             if profile_img:
                 send_telegram_photo(profile_img)
